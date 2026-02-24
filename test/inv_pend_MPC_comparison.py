@@ -10,6 +10,7 @@ import numpy as np
 from scipy.linalg import solve_discrete_are, solve_continuous_are
 
 from csnn import set_sym_type, Linear, Sequential, ReLU, Softplus
+
 from models.inverted_pendulum import InvertedPendulum
 
 
@@ -27,7 +28,6 @@ def get_model_name(layer_sizes):
         Model name in format like '2x6x6x1'
     """
     return 'x'.join(map(str, layer_sizes))
-
 
 def find_latest_params(model_dir, model_name, extension="yaml"):
     """Find the most recent parameter file for a given model.
@@ -52,7 +52,6 @@ def find_latest_params(model_dir, model_name, extension="yaml"):
         return None
     latest_file = max(files, key=lambda f: f.stat().st_mtime)
     return latest_file
-
 
 def load_params(params_file):
     """Load optimal parameters from a file.
@@ -93,7 +92,6 @@ def load_params(params_file):
         
     return params_init_vec
 
-
 class InvertedPendulumMPCComparison:
     """Class for comparing optimal MPC with learned neural network policy for inverted pendulum system."""
     
@@ -118,7 +116,7 @@ class InvertedPendulumMPCComparison:
         self.layer_sizes = layer_sizes
         self.beta = beta
         self.N = horizon
-        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent / "models"
+        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn"
         
         # Initialize inverted pendulum model
         self.inverted_pendulum = InvertedPendulum(sym_type='SX')
@@ -156,7 +154,7 @@ class InvertedPendulumMPCComparison:
         for i in range(len(self.layer_sizes) - 1):
             layers.append(Linear(self.layer_sizes[i], self.layer_sizes[i + 1]))
             if i < len(self.layer_sizes) - 2:  # add activation for all but last layer
-                layers.append(Softplus(beta=self.beta))
+                layers.append(ReLU())
         self.net = Sequential[ca.SX](tuple(layers))
         
         self.n_param = self.net.num_parameters

@@ -29,3 +29,8 @@ images/
 # OS
 .DS_Store
 Thumbs.db
+
+# Files
+cli.py
+install.sh
+QUICKSTART.md

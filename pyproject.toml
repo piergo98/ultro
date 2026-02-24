@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultro"
+version = "0.1.0"
+description = "Unsupervised Learning Through Robust Optimization"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Pietro", email = "piergo98@gmail.com"}
+]
+keywords = ["mpc", "neural-networks", "control", "optimization", "casadi"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "matplotlib>=3.3.0",
+    "casadi>=3.5.0",
+    "pyyaml>=5.4.0",
+    "csnn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "isort>=5.0",
+    "flake8>=3.9",
+]
+
+[project.scripts]
+# ultro-train-cartpole = "ultro.cli:train_cartpole"
+# ultro-train-invpend = "ultro.cli:train_invpend"
+# ultro-test = "ultro.cli:run_tests"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "models*", "test*", "ultro*"]
+exclude = ["tests*", "docs*", "__pycache__*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
