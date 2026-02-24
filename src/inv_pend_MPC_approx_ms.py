@@ -101,7 +101,7 @@ class InvertedPendulumMPCInputVar:
         
         # Setup model directory
         if model_dir is None:
-            self.model_dir = Path(__file__).parent / "models_nn"
+            self.model_dir = Path(__file__).parent.parent / "models_nn"
         else:
             self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
