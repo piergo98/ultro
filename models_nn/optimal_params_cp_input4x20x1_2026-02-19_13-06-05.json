@@ -1,0 +1,12 @@
+{
+  "n_param": 121,
+  "layer_sizes": [
+    4,
+    20,
+    1
+  ],
+  "model_name": "4x20x1",
+  "batch_size": 40,
+  "horizon": 20,
+  "date": "2026-02-19_13-06-05"
+}

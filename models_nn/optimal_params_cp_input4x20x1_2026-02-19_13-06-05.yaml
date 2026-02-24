@@ -1,0 +1,9 @@
+batch_size: 40
+date: 2026-02-19_13-06-05
+horizon: 20
+layer_sizes:
+- 4
+- 20
+- 1
+model_name: 4x20x1
+n_param: 121
