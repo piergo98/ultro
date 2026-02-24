@@ -136,6 +136,6 @@ If you use this package in your research, please cite:
   title={Ultro: Unsupervised Learning Through Robust Optimization},
   author={Pietro},
   year={2026},
-  url={https://github.com/yourusername/ultro}
+  url={https://github.com/piergo98/ultro}
 }
 ```
