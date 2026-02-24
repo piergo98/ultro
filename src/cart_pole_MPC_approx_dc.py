@@ -11,7 +11,7 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 
 from csnn import set_sym_type, Linear, Sequential, ReLU, Softplus
-from learning_problem.models.cart_pole import CartPole
+from models.cart_pole import CartPole
 
 
 class CartPoleMPCInputCollocation:
