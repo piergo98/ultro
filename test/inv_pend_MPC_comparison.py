@@ -6,6 +6,7 @@ import yaml
 
 import casadi as ca
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from scipy.linalg import solve_discrete_are, solve_continuous_are
 
@@ -154,7 +155,7 @@ class InvertedPendulumMPCComparison:
         for i in range(len(self.layer_sizes) - 1):
             layers.append(Linear(self.layer_sizes[i], self.layer_sizes[i + 1]))
             if i < len(self.layer_sizes) - 2:  # add activation for all but last layer
-                layers.append(ReLU())
+                layers.append(Softplus(beta=self.beta))
         self.net = Sequential[ca.SX](tuple(layers))
         
         self.n_param = self.net.num_parameters
@@ -234,6 +235,9 @@ class InvertedPendulumMPCComparison:
         self.theta_bound = np.pi/3
         self.omega_bound = 2.0
         
+        # Control bounds
+        self.u_bound = 10.0
+        
         # Initialize state as symbolic parameter
         Xk = ca.SX.sym('X_0', self.NX)
         w += [Xk]
@@ -244,8 +248,8 @@ class InvertedPendulumMPCComparison:
         for k in range(self.N):
             u_k = ca.SX.sym('u_' + str(k), self.NU)
             w += [u_k]
-            lbw += [-25.0]*self.NU
-            ubw += [25.0]*self.NU
+            lbw += [-self.u_bound]*self.NU
+            ubw += [self.u_bound]*self.NU
             self.w0 += [0.0]*self.NU
             
             # Compute next state
@@ -280,7 +284,7 @@ class InvertedPendulumMPCComparison:
         
         # Create NLP solver
         nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g)}
-        opts = {"expand": False, "ipopt": {"print_level": 0, "max_iter": 3000, "tol": 1e-8}}
+        opts = {"expand": False, "print_time": False, "ipopt": {"print_level": 0, "max_iter": 3000, "tol": 1e-8}}
         self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
     
     def generate_test_states(self, n_test=20, seed=42):
@@ -294,7 +298,7 @@ class InvertedPendulumMPCComparison:
             Random seed for reproducibility.
         """
         np.random.seed(seed)
-        theta_test_bound = np.pi/8
+        theta_test_bound = np.pi/6
         omega_test_bound = 1.0
         
         self.initial_states = np.zeros((n_test, self.NX))
@@ -371,8 +375,9 @@ class InvertedPendulumMPCComparison:
             u_sim = np.zeros((self.NU, self.N))
             x_sim[:, 0] = x0
             for k in range(self.N):
-                u_sim[:, k] = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()
-                x_next, _ = self.f_dyn(x_sim[:, k], u_sim[:, k])
+                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()
+                u_sim[:, k] = u_next
+                x_next, _ = self.f_dyn(x_sim[:, k], u_next)
                 x_sim[:, k + 1] = x_next.full().flatten()
             
             # Check for NaN values in the simulation
@@ -489,8 +494,8 @@ class InvertedPendulumMPCComparison:
         avg_rmse_states = np.mean(self.rmse_states_batch, axis=0)
         avg_rmse_u = np.mean(self.rmse_u_batch)
         
-        t_x = np.arange(self.N + 1)
-        t_u = np.arange(self.N)
+        t_x = self.inverted_pendulum.dt * np.arange(self.N + 1)
+        t_u = self.inverted_pendulum.dt * np.arange(self.N)
         
         plt.figure(figsize=(12, 10))
         
@@ -532,7 +537,116 @@ class InvertedPendulumMPCComparison:
         
         plt.suptitle(f'Optimal vs Learned Policy ({N_VALID} Valid Test Cases)')
         plt.tight_layout(rect=[0, 0, 1, 0.96])
+        
+    def plot_policy(self):
+        """Plot learned policy vs optimal control."""
+        
+        # Create a grid of states for plotting the policy
+        theta_grid = np.linspace(-self.theta_bound, self.theta_bound, 50)
+        # omega_grid = np.linspace(-self.omega_bound, self.omega_bound, 50)
+
+        # Compute optimal control and learned control on the grid
+        U_opt_grid = np.zeros(theta_grid.shape[0])
+        U_learned_grid = np.zeros(theta_grid.shape[0])
+
+        for i in range(theta_grid.shape[0]):
+            x_i = [theta_grid[i], 0.0]  # zero angular velocity slice
+            # Solve MPC for this state to get optimal control
+            lbw_i = self.lbw.copy()
+            ubw_i = self.ubw.copy()
+            lbw_i[:self.NX] = x_i
+            ubw_i[:self.NX] = x_i
+            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
+            w_opt = solution['x'].full().flatten()
+            _, u_opt_traj = self.extract_traj(w_opt)
+            U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
+
+            # Compute learned control
+            U_learned_grid[i] = self.net_fcn(x_i, self.params_init_vec).full().flatten()[0]
+
+        # Reshape for plotting
+        U_opt_grid = U_opt_grid.reshape(theta_grid.shape)
+        U_learned_grid = U_learned_grid.reshape(theta_grid.shape)
+
+        fig = plt.figure(figsize=(14, 6))
+        ax1 = fig.add_subplot(1, 2, 1)
+        ax1.plot(theta_grid, U_opt_grid.flatten(), alpha=0.5, color='C0', linewidth=2)
+        ax1.set_title('Optimal Control Policy')
+        ax1.set_xlabel('Angle (rad)')
+        ax1.set_ylabel('Control')
+        ax1.grid(True)
+
+        ax2 = fig.add_subplot(1, 2, 2)
+        ax2.plot(theta_grid, U_learned_grid.flatten(), alpha=0.5, color='C1', linewidth=2)
+        ax2.set_title(f'Learned Control Policy')
+        ax2.set_xlabel('Angle (rad)')
+        ax2.set_ylabel('Control')
+        ax2.grid(True)
+
+        plt.tight_layout()
     
+    def plot_policy_3d(self, elev=30, azim=-60):
+        """3D surface plot of optimal and learned control policies.
+
+        Parameters
+        ----------
+        elev : float
+            Elevation angle for 3D view.
+        azim : float
+            Azimuth angle for 3D view.
+        """
+        avg_rmse_u = np.mean(self.rmse_u_batch)
+
+        # Create a grid of states for plotting the policy
+        theta_grid = np.linspace(-self.theta_bound, self.theta_bound, 50)
+        omega_grid = np.linspace(-self.omega_bound, self.omega_bound, 50)
+        Theta, Omega = np.meshgrid(theta_grid, omega_grid)
+        X_grid = np.vstack([Theta.flatten(), Omega.flatten()])
+
+        # Compute optimal control and learned control on the grid
+        U_opt_grid = np.zeros(X_grid.shape[1])
+        U_learned_grid = np.zeros(X_grid.shape[1])
+
+        for i in range(X_grid.shape[1]):
+            x_i = X_grid[:, i]
+            # Solve MPC for this state to get optimal control
+            lbw_i = self.lbw.copy()
+            ubw_i = self.ubw.copy()
+            lbw_i[:self.NX] = x_i.tolist()
+            ubw_i[:self.NX] = x_i.tolist()
+            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
+            w_opt = solution['x'].full().flatten()
+            _, u_opt_traj = self.extract_traj(w_opt)
+            U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
+
+            # Compute learned control
+            U_learned_grid[i] = self.net_fcn(x_i, self.params_init_vec).full().flatten()[0]
+
+        # Reshape for plotting
+        U_opt_grid = U_opt_grid.reshape(Theta.shape)
+        U_learned_grid = U_learned_grid.reshape(Theta.shape)
+
+        fig = plt.figure(figsize=(14, 6))
+        ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+        surf1 = ax1.plot_surface(Theta, Omega, U_opt_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
+        fig.colorbar(surf1, ax=ax1, shrink=0.6)
+        ax1.set_title('Optimal Control Policy (3D)')
+        ax1.set_xlabel('Angle (rad)')
+        ax1.set_ylabel('Angular Velocity (rad/s)')
+        ax1.set_zlabel('Control')
+        ax1.view_init(elev=elev, azim=azim)
+
+        ax2 = fig.add_subplot(1, 2, 2, projection='3d')
+        surf2 = ax2.plot_surface(Theta, Omega, U_learned_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
+        fig.colorbar(surf2, ax=ax2, shrink=0.6)
+        ax2.set_title(f'Learned Policy (3D)')
+        ax2.set_xlabel('Angle (rad)')
+        ax2.set_ylabel('Angular Velocity (rad/s)')
+        ax2.set_zlabel('Control')
+        ax2.view_init(elev=elev, azim=azim)
+
+        plt.tight_layout()
+
     def plot_errors(self):
         """Plot trajectory errors."""
         N_VALID = len(self.valid_indices)
@@ -645,12 +759,12 @@ if __name__ == "__main__":
     # Create comparison object
     comparison = InvertedPendulumMPCComparison(
         layer_sizes=[2, 20, 1],
-        beta=2.0,
+        beta=15.0,
         horizon=10
     )
     
     # Generate test states
-    comparison.generate_test_states(n_test=20, seed=42)
+    comparison.generate_test_states(n_test=200, seed=42)
     
     # Run comparison
     comparison.run_comparison(wait_for_input=True)
@@ -660,6 +774,8 @@ if __name__ == "__main__":
     
     # Generate plots
     comparison.plot_trajectories()
+    comparison.plot_policy()
+    # comparison.plot_policy_3d()
     comparison.plot_errors()
     comparison.plot_costs()
     comparison.show_plots()

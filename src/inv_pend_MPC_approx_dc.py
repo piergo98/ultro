@@ -80,16 +80,16 @@ class InvertedPendulumMPCInputCollocation:
         self.ur = ca.DM([0.0])
         
         # Training bounds
-        self.theta_train_bound = np.pi / 6
-        self.omega_train_bound = 1.0
+        self.theta_train_bound = np.pi / 3
+        self.omega_train_bound = 2.0
         
         # State bounds
         self.theta_bound = np.pi / 3
         self.omega_bound = 2.0
         
         # Control bounds
-        self.u_min = -100.0
-        self.u_max = 100.0
+        self.u_min = -10.0
+        self.u_max = 10.0
         
         # Setup model directory
         if model_dir is None:
@@ -166,6 +166,7 @@ class InvertedPendulumMPCInputCollocation:
             try:
                 params_init = self.load_params(params_file, self.n_param)
                 print(f"Loaded pre-optimized parameters from {params_file}")
+                input("Press Enter to continue with these parameters, or Ctrl+C to abort ")
                 return params_init
             except (FileNotFoundError, ValueError) as e:
                 print(f"Could not load parameters from {params_file}: {e}")
@@ -390,6 +391,9 @@ class InvertedPendulumMPCInputCollocation:
                 "tol": 1e-6,
                 "hsllib": "/home/pietro/ThirdParty-HSL/coinhsl-2024.05.15/install/lib/x86_64-linux-gnu/libcoinhsl.so",
                 "linear_solver": "ma86",
+                "warm_start_init_point": "yes",
+                "warm_start_bound_push": 1e-6,
+                "warm_start_bound_frac": 1e-6,
             }
         }
         self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
@@ -511,13 +515,13 @@ class InvertedPendulumMPCInputCollocation:
         }
         
         # Save JSON
-        json_path = self.model_dir / f"optimal_params_inv_dc_{self.model_name}_{date_str}.json"
+        json_path = self.model_dir / f"optimal_params_ip_{self.model_name}_{date_str}.json"
         with json_path.open("w") as f:
             json.dump(params_dict, f, indent=2)
         print(f"Saved parameters to {json_path}")
         
         # Save YAML
-        yaml_path = self.model_dir / f"optimal_params_inv_dc_{self.model_name}_{date_str}.yaml"
+        yaml_path = self.model_dir / f"optimal_params_ip_{self.model_name}_{date_str}.yaml"
         with yaml_path.open("w") as f:
             yaml.safe_dump(params_dict, f)
         print(f"Saved parameters to {yaml_path}")
@@ -663,7 +667,7 @@ class InvertedPendulumMPCInputCollocation:
         latest_file : Path or None
             Path to the most recent parameter file, or None if not found.
         """
-        pattern = f"optimal_params_cp_input{model_name}_*.{extension}"
+        pattern = f"optimal_params_ip_{model_name}_*.{extension}"
         files = list(model_dir.glob(pattern))
         if not files:
             return None
@@ -674,10 +678,10 @@ def main():
     # Configure the problem
     mpc = InvertedPendulumMPCInputCollocation(
         layer_sizes=[2, 20, 1],
-        batch_size=50,
+        batch_size=70,
         horizon=10,
         degree=3,
-        beta=2.0,
+        beta=15.0,
         q_weights=[30, 1],
         r_weight=1.0,
         regularization=1e-4,
@@ -685,10 +689,10 @@ def main():
     )
     
     # Initialize params with warm start
-    warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters())
+    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters())
     
-    # params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
-    # warm_params = mpc.initialize_parameters(params_file)
+    params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+    warm_params = mpc.initialize_parameters(params_file)
 
     # Setup and solve the optimization problem
     mpc.setup_optimization(warm_params)

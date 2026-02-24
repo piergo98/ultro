@@ -225,6 +225,7 @@ class InvertedPendulumMPCInputVar:
             try:
                 params_init = self.load_params(params_file, self.n_param)
                 print(f"Loaded pre-optimized parameters from {params_file}")
+                input("Press Enter to continue with these parameters, or Ctrl+C to abort ")
                 return params_init
             except (FileNotFoundError, ValueError) as e:
                 print(f"Could not load parameters from {params_file}: {e}")
@@ -653,7 +654,7 @@ class InvertedPendulumMPCInputVar:
         latest_file : Path or None
             Path to the most recent parameter file, or None if not found.
         """
-        pattern = f"optimal_params_cp_input{model_name}_*.{extension}"
+        pattern = f"optimal_params_ip_{model_name}_*.{extension}"
         files = list(model_dir.glob(pattern))
         if not files:
             return None
@@ -667,9 +668,9 @@ def main():
     mpc = InvertedPendulumMPCInputVar(
         layer_sizes=[2, 20, 1],
         batch_size=40,
-        horizon=10,
+        horizon=15,
         rk4_steps=4,
-        beta=3.0,
+        beta=10.0,
         q_weights=[30, 1],
         r_weight=1.0,
         regularization=1e-4,
@@ -677,7 +678,9 @@ def main():
         use_jit=False
     )
     # Initialize params with warm start
-    warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters())
+    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters())
+    params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+    warm_params = mpc.initialize_parameters(params_file)
 
     # Setup and solve the optimization problem
     mpc.setup_optimization(warm_params)
