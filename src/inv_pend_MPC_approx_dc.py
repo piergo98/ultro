@@ -175,7 +175,15 @@ class InvertedPendulumMPCInputCollocation:
         print("Using Kaiming (He) initialization.")
         return self.parameter_initialization_he()
     
-    def network_warm_start_with_sgd(self, params_init, learning_rate=1e-2, iterations=500):
+    def generate_intial_states(self):
+        """Generate initial states for training."""
+        self.X_train = np.random.uniform(
+            low=np.array([-self.theta_train_bound, -self.omega_train_bound]).reshape(-1, 1),
+            high=np.array([self.theta_train_bound, self.omega_train_bound]).reshape(-1, 1),
+            size=(self.NX, self.NB)
+        )
+    
+    def network_warm_start_with_sgd(self, params_init, learning_rate=1e-3, num_samples=20, iterations=500):
         """Warm start network parameters using simple SGD on a surrogate loss.
         
         Parameters
@@ -184,6 +192,8 @@ class InvertedPendulumMPCInputCollocation:
             Initial parameters to warm start from.
         learning_rate : float
             Learning rate for SGD.
+        num_samples : int
+                Number of training samples to use for the surrogate loss.
         iterations : int
             Number of SGD iterations.
             
@@ -194,28 +204,23 @@ class InvertedPendulumMPCInputCollocation:
         """
         print("Starting network warm start with SGD...")
         
-        # Generate random training data for surrogate loss
-        num_samples = 100
-        X_train = np.random.uniform(
-            low=[-self.theta_train_bound, -self.omega_train_bound],
-            high=[self.theta_train_bound, self.omega_train_bound],
-            size=(num_samples, self.NX)
-        )
+        # Extarct the first num_samples training data for surrogate loss
+        X_train = self.X_train[:, :num_samples]
         
         # Rollout the MPC 
         U_target = []
         for i in range(num_samples):
-            u_opt = self.inverted_pend.solve_MPC(X_train[i, :].T)
+            u_opt = self.inverted_pend.solve_MPC(X_train[:, i])
             U_target.append(u_opt)
         
         U_target = np.array(U_target).reshape(self.NU, num_samples)
         
         # Forward pass
         F = self.net_fcn.map(num_samples)
-        U_pred = F(X_train.T, self.params_flattened)
+        U_pred = F(X_train, self.params_flattened)
         
         # Compute loss (MSE) and its gradient
-        loss = ca.sqrt(ca.sumsqr(U_pred - U_target)) / num_samples
+        loss = ca.sqrt(ca.sumsqr(U_pred - U_target)) / num_samples + self.regularization * ca.dot(self.params_flattened, self.params_flattened)
         loss_fcn = ca.Function('loss_fcn', [self.params_flattened], [loss])
         grad = ca.gradient(loss, self.params_flattened)
         grad_fcn = ca.Function('grad_fcn', [self.params_flattened], [grad])
@@ -223,30 +228,109 @@ class InvertedPendulumMPCInputCollocation:
         # SGD loop
         params = params_init.copy()
         for it in range(iterations):
-            # X_train = np.random.uniform(
-            #     low=[-self.theta_train_bound, -self.omega_train_bound],
-            #     high=[self.theta_train_bound, self.omega_train_bound],
-            #     size=(num_samples, self.NX)
-            # )
-            u_pred = F(X_train.T, params)
-            
             grad_val = grad_fcn(params.reshape(-1, 1)).full().flatten()
             params -= learning_rate * grad_val
             
             if (it + 1) % 50 == 0 or it == 0:
+                u_pred = F(X_train, params)
                 loss_val = loss_fcn(params.reshape(-1, 1)).full().item()
-                print(f"SGD iteration {it + 1}/{iterations}, Loss: {loss_val:.4f}")
+                print(f"SGD iteration {it + 1}/{iterations}, Loss: {loss_val:.4f}, Grad Norm: {np.linalg.norm(grad_val):.4f}")
+                print(f"Sample predictions: {u_pred.full().flatten()[:5]}, Targets: {U_target.flatten()[:5]}")
         
         print("Network warm start complete.")
         return params
     
-    def setup_optimization(self, params_init=None):
+    def generate_state_warm_start(self, X0):
+        """Generate state warm start by forward propagating with zero control.
+        
+        Parameters
+        ----------
+        X0 : np.ndarray
+            Initial states for each batch element (NX x NB).
+            
+        Returns
+        -------
+        state_warm_start : dict
+            Dictionary mapping (batch_idx, time_idx) -> state value for interval endpoints
+            and (batch_idx, time_idx, colloc_idx) -> state value for collocation points.
+        """
+        print("Generating state warm start by forward propagating with zero control...")
+        
+        # Get collocation coefficients
+        C_coeff, D_coeff, B_coeff, tau_root = self.get_collocation_coefficients(self.degree)
+        
+        # Create dynamics function for numerical integration
+        state_warm_start = {}
+        
+        for i in range(self.NB):
+            x_current = X0[:, i].reshape(-1, 1)
+            
+            # Store initial state
+            state_warm_start[(i, 0)] = x_current.flatten()
+            
+            for k in range(self.N):
+                # Zero control input
+                u_zero = np.zeros((self.NU, 1))
+                
+                # Use RK4 integration over the interval with collocation points
+                # First, compute states at collocation points using simple Euler steps
+                for j in range(self.degree):
+                    # Time fraction within interval
+                    tau = tau_root[j + 1]
+                    dt_frac = tau * self.inverted_pend.dt
+                    
+                    # Simple forward Euler from interval start
+                    x_dot_val = self.inverted_pend.dynamics(x_current, u_zero).full()
+                    x_colloc = x_current + dt_frac * x_dot_val
+                    
+                    state_warm_start[(i, k, j)] = x_colloc.flatten()
+                
+                # Compute state at end of interval using RK4
+                x_next = self.rk4_step(x_current, u_zero, self.inverted_pend.dynamics, self.inverted_pend.dt)
+                x_current = x_next
+                
+                # Store state at end of interval
+                state_warm_start[(i, k + 1)] = x_current.flatten()
+        
+        print("State warm start generation complete.")
+        return state_warm_start
+    
+    @staticmethod
+    def rk4_step(x, u, f_dyn, dt):
+        """Single RK4 integration step.
+        
+        Parameters
+        ----------
+        x : np.ndarray
+            Current state.
+        u : np.ndarray
+            Control input.
+        f_dyn : ca.Function
+            Dynamics function.
+        dt : float
+            Time step.
+            
+        Returns
+        -------
+        x_next : np.ndarray
+            Next state.
+        """
+        k1 = f_dyn(x, u).full()
+        k2 = f_dyn(x + 0.5 * dt * k1, u).full()
+        k3 = f_dyn(x + 0.5 * dt * k2, u).full()
+        k4 = f_dyn(x + dt * k3, u).full()
+        x_next = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        return x_next
+    
+    def setup_optimization(self, params_init=None, use_state_warm_start=True):
         """Set up the NLP optimization problem.
         
         Parameters
         ----------
         params_init : np.ndarray, optional
             Initial parameters. If None, will use He initialization.
+        use_state_warm_start : bool, optional
+            Whether to use state warm start by forward propagating with zero control.
         """
         print("Setting up optimization for learning problem...")
         
@@ -254,8 +338,13 @@ class InvertedPendulumMPCInputCollocation:
         if params_init is None:
             params_init = self.initialize_parameters()
         
+        # Generate state warm start if requested
+        state_warm_start = None
+        if use_state_warm_start:
+            state_warm_start = self.generate_state_warm_start(self.X_train)
+        
         # Get collocation coefficients
-        C_coeff, D_coeff, B_coeff = self.get_collocation_coefficients()
+        C_coeff, D_coeff, B_coeff, tau_root = self.get_collocation_coefficients()
         
         # Define dynamics and stage cost
         x = ca.SX.sym('x', self.NX)
@@ -289,17 +378,22 @@ class InvertedPendulumMPCInputCollocation:
         # Define one NLP for each batch element
         for i in range(self.NB):
             # Generate random initial state for this batch element
-            theta0 = np.random.uniform(-self.theta_train_bound, self.theta_train_bound)
-            omega0 = np.random.uniform(-self.omega_train_bound, self.omega_train_bound)
-            x0 = [theta0, omega0]
+            # theta0 = np.random.uniform(-self.theta_train_bound, self.theta_train_bound)
+            # omega0 = np.random.uniform(-self.omega_train_bound, self.omega_train_bound)
+            x0 = self.X_train[:, i]
+            x_target = np.array([0.0, 0.0])  # Target state (origin)
             
             # Initial state
             Xk = ca.SX.sym('X_' + str(i) + '_0', self.NX)
             w += [Xk]
-            lbw += x0
-            ubw += x0
-            w0 += x0
-            
+            lbw += x0.tolist()
+            ubw += x0.tolist()
+            # Use warm start if available
+            if state_warm_start is not None:
+                w0 += state_warm_start[(i, 0)].tolist()
+            else:
+                w0 += x0.tolist()
+        
             for k in range(self.N):
                 # Control input
                 u_k = ca.SX.sym('U_' + str(i) + '_' + str(k), self.NU)
@@ -309,7 +403,7 @@ class InvertedPendulumMPCInputCollocation:
                 w0 += [0.0] * self.NU
                 
                 # Add constraint on control input as function approximator
-                g += [u_k - self.net_fcn(Xk, z)]
+                g += [u_k - self.net_fcn(x0, z)[k]]
                 lbg += [0.0] * self.NU
                 ubg += [0.0] * self.NU
                 
@@ -321,7 +415,14 @@ class InvertedPendulumMPCInputCollocation:
                     w += [Xkj]
                     lbw += [-self.theta_bound, -self.omega_bound]
                     ubw += [self.theta_bound, self.omega_bound]
-                    w0 += [0.0] * self.NX
+                    # Use warm start if available
+                    if state_warm_start is not None:
+                        w0 += state_warm_start[(i, k, j)].tolist()
+                    else:
+                        # Fallback: linear interpolation for collocation points
+                        alpha = (k + tau_root[j+1]) / self.N
+                        x_warm = (1 - alpha) * x0 + alpha * x_target
+                        w0 += x_warm.tolist()
                 
                 # Loop over collocation points
                 Xk_end = D_coeff[0] * Xk
@@ -348,7 +449,14 @@ class InvertedPendulumMPCInputCollocation:
                 w += [Xk]
                 lbw += [-self.theta_bound, -self.omega_bound]
                 ubw += [self.theta_bound, self.omega_bound]
-                w0 += [0.0] * self.NX
+                # Use warm start if available
+                if state_warm_start is not None:
+                    w0 += state_warm_start[(i, k + 1)].tolist()
+                else:
+                    # Fallback: linear interpolation for interval end states
+                    alpha = (k + 1) / self.N
+                    x_warm = (1 - alpha) * x0 + alpha * x_target
+                    w0 += x_warm.tolist()
                 
                 # Add dynamics constraint
                 g += [Xk_end - Xk]
@@ -370,6 +478,9 @@ class InvertedPendulumMPCInputCollocation:
         self.ubw = ubw
         self.lbg = lbg
         self.ubg = ubg
+        
+        # print(w0)
+        # raise NotImplementedError("NLP setup complete. Call solve() to solve the optimization problem.")
         
         # Create NLP problem
         nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g)}
@@ -410,7 +521,7 @@ class InvertedPendulumMPCInputCollocation:
             lbx=self.lbw,
             ubx=self.ubw,
             lbg=self.lbg,
-            ubg=self.ubg
+            ubg=self.ubg,
         )
         print("NLP solved.")
         
@@ -576,7 +687,7 @@ class InvertedPendulumMPCInputCollocation:
             pint = np.polyint(p)
             B[j] = pint(1.0)
         
-        return C, D, B
+        return C, D, B, tau_root
     
     @staticmethod
     def load_params(params_file, n_param):
@@ -677,25 +788,27 @@ class InvertedPendulumMPCInputCollocation:
 def main():
     # Configure the problem
     mpc = InvertedPendulumMPCInputCollocation(
-        layer_sizes=[2, 20, 1],
-        batch_size=70,
+        layer_sizes=[2, 20, 10],
+        batch_size=40,
         horizon=10,
         degree=3,
-        beta=15.0,
+        beta=10.0,
         q_weights=[30, 1],
         r_weight=1.0,
         regularization=1e-4,
         seed=42
     )
     
+    mpc.generate_intial_states()
+    
     # Initialize params with warm start
-    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters())
+    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
     
     params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
     warm_params = mpc.initialize_parameters(params_file)
 
     # Setup and solve the optimization problem
-    mpc.setup_optimization(warm_params)
+    mpc.setup_optimization(warm_params, use_state_warm_start=True)
     mpc.solve()
     
     # Visualize results
