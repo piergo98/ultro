@@ -621,6 +621,7 @@ class InvertedPendulumMPCInputCollocation:
             "layer_sizes": self.layer_sizes,
             "model_name": self.model_name,
             "batch_size": int(self.NB),
+            "beta": float(self.beta),
             "horizon": int(self.N),
             "date": date_str
         }
@@ -792,7 +793,7 @@ def main():
         batch_size=40,
         horizon=10,
         degree=3,
-        beta=10.0,
+        beta=50.0,
         q_weights=[30, 1],
         r_weight=1.0,
         regularization=1e-4,

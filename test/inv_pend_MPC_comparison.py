@@ -311,6 +311,7 @@ class InvertedPendulumMPCComparison:
         """Load parameters for the learned policy."""
         model_name = get_model_name(self.layer_sizes)
         params_file = find_latest_params(self.model_dir, model_name, "yaml")
+        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/optimal_params_ip_2x20x10_2026-03-02_14-55-53.yaml"
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         self.params_init_vec = load_params(params_file)
@@ -375,7 +376,7 @@ class InvertedPendulumMPCComparison:
             u_sim = np.zeros((self.NU, self.N))
             x_sim[:, 0] = x0
             for k in range(self.N):
-                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()
+                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
                 u_sim[:, k] = u_next
                 x_next, _ = self.f_dyn(x_sim[:, k], u_next)
                 x_sim[:, k + 1] = x_next.full().flatten()
@@ -567,21 +568,34 @@ class InvertedPendulumMPCComparison:
         # Reshape for plotting
         U_opt_grid = U_opt_grid.reshape(theta_grid.shape)
         U_learned_grid = U_learned_grid.reshape(theta_grid.shape)
+        
+        # Compute error
+        U_error = np.abs(U_opt_grid - U_learned_grid)
 
-        fig = plt.figure(figsize=(14, 6))
-        ax1 = fig.add_subplot(1, 2, 1)
+        fig = plt.figure(figsize=(14, 8))
+        
+        # First row: Optimal and Learned policies side by side
+        ax1 = fig.add_subplot(2, 2, 1)
         ax1.plot(theta_grid, U_opt_grid.flatten(), alpha=0.5, color='C0', linewidth=2)
         ax1.set_title('Optimal Control Policy')
         ax1.set_xlabel('Angle (rad)')
         ax1.set_ylabel('Control')
         ax1.grid(True)
 
-        ax2 = fig.add_subplot(1, 2, 2)
+        ax2 = fig.add_subplot(2, 2, 2)
         ax2.plot(theta_grid, U_learned_grid.flatten(), alpha=0.5, color='C1', linewidth=2)
         ax2.set_title(f'Learned Control Policy')
         ax2.set_xlabel('Angle (rad)')
         ax2.set_ylabel('Control')
         ax2.grid(True)
+        
+        # Second row: Error plot spanning the width
+        ax3 = fig.add_subplot(2, 1, 2)
+        ax3.semilogy(theta_grid, U_error.flatten(), alpha=0.7, color='C2', linewidth=2)
+        ax3.set_title('|Control Error| (log scale)')
+        ax3.set_xlabel('Angle (rad)')
+        ax3.set_ylabel('|Optimal - Learned|')
+        ax3.grid(True, which='both')
 
         plt.tight_layout()
     
@@ -758,8 +772,8 @@ class InvertedPendulumMPCComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = InvertedPendulumMPCComparison(
-        layer_sizes=[2, 20, 1],
-        beta=15.0,
+        layer_sizes=[2, 20, 10],
+        beta=30.0,
         horizon=10
     )
     
@@ -777,5 +791,5 @@ if __name__ == "__main__":
     comparison.plot_policy()
     # comparison.plot_policy_3d()
     comparison.plot_errors()
-    comparison.plot_costs()
+    # comparison.plot_costs()
     comparison.show_plots()
