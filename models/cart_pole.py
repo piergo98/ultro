@@ -7,20 +7,20 @@ from scipy.linalg import solve_discrete_are, solve_continuous_are
 
 # Class implementing the cart-pole environment
 class CartPole:
-    def __init__(self, dt=0.1, sym_type='SX'):
+    def __init__(self, dt=0.05, sym_type='SX'):
         self.dt = dt  # time step
         self.g = 9.81  # gravity
         self.l = 0.5   # length of the pole
-        self.m = 0.05   # mass of the pole
-        self.M = 0.5   # mass of the cart
+        self.m = 0.08   # mass of the pole
+        self.M = 0.8   # mass of the cart
         self.sym_type = sym_type  # symbolic type for CasADi (SX or MX)
         
         self.dynamics = self.dynamics_func()  # CasADi function for dynamics
         self.step = self.step_func()  # CasADi function for RK4 integration
         self.lin_dyn = self.linearized_dynamics()  # CasADi function for linearized dynamics
         
-        N = 20  # MPC horizon
-        self.define_simple_MPC_control(N)  # Define the MPC controller
+        self.N = 20  # MPC horizon
+        self.define_simple_MPC_control(self.N)  # Define the MPC controller
 
     def dynamics_func(self):
         ''' Computes the time derivative of the state given the current state and control input. '''
@@ -97,7 +97,7 @@ class CartPole:
         # Define cost function (quadratic cost on state deviation and control effort)
         xr = ca.DM([0.0, 0, 0, 0])  # desired state (upright position)
         Q = ca.diag(ca.DM([100, 1, 30, 1]))  # state cost weights
-        R = ca.diag(ca.DM([1.0]))  # control cost weight
+        R = ca.diag(ca.DM([0.01]))  # control cost weight
         A, B = self.lin_dyn(xr, ca.DM([0]))  # linearized dynamics around the upright position
         E = solve_continuous_are(A.full(), B.full(), Q.full(), R.full())
         
@@ -132,8 +132,8 @@ class CartPole:
         for k in range(N):
             uk = ca.SX.sym('u_' + str(k), 1)
             w += [uk]
-            self.lbw += [-10.0]  # control limits
-            self.ubw += [10.0]
+            self.lbw += [-25.0]  # control limits
+            self.ubw += [25.0]
             self.w0 += [0.0]     # initial guess
             
             Xk_next, l_k = F(Xk, uk)
@@ -152,7 +152,7 @@ class CartPole:
         J += (Xk - xr).T @ ca.DM(E) @ (Xk - xr)  # terminal cost
         # Create an NLP solver instance
         nlp_prob = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': x0}
-        opts = {"ipopt.print_level": 3, "print_time": 0, "verbose": False}
+        opts = {"ipopt.print_level": 0, "print_time": False, "verbose": False}
         self.solver = ca.nlpsol("solver", "ipopt", nlp_prob, opts)
     
     def solve_MPC(self, x0):
@@ -176,7 +176,7 @@ class CartPole:
         # Return the optimal control sequence
         return u_opt.full().flatten()[0]  # return only the first control input
         
-    def simulate_and_plot(self, x0, control_policy, N, title="Cart-Pole Simulation"):
+    def close_loop_simulation(self, x0, control_policy=None, plot_results=True):
         """Simulate the cart-pole system and plot the results.
         
         Parameters
@@ -185,11 +185,11 @@ class CartPole:
             Initial state [position, velocity, angle, angular_velocity].
         control_policy : callable or array_like
             Either a function that takes state and returns control u = policy(x),
-            or an array of control inputs for each time step.
+            or an array of control inputs for each time step. If None, the MPC controller will be used.
         N : int
             Number of simulation steps.
-        title : str, optional
-            Title for the plot.
+        plot_results : bool, optional
+            Whether to plot the results (default: True).
         
         Returns
         -------
@@ -199,13 +199,13 @@ class CartPole:
             Control trajectory of shape (N,).
         """
         # Initialize trajectories
-        x_traj = np.zeros((N + 1, 4))
-        u_traj = np.zeros(N)
+        x_traj = np.zeros((self.N + 1, 4))
+        u_traj = np.zeros(self.N)
         
         x_traj[0] = np.array(x0).flatten()
         
         # Simulate forward in time
-        for k in range(N):
+        for k in range(self.N):
             # Get control input
             if control_policy is None:
                 u_k = self.solve_MPC(x_traj[k])  # Solve MPC to get control input for current state
@@ -226,11 +226,15 @@ class CartPole:
             x_next = self.step(x_traj[k], [u_k])
             x_traj[k + 1] = np.array(x_next.full()).flatten()
         
+        if not plot_results:
+            return x_traj, u_traj
+        
         # Plot results
-        time = np.arange(N + 1) * self.dt
-        time_u = np.arange(N) * self.dt
+        time = np.arange(self.N + 1) * self.dt
+        time_u = np.arange(self.N) * self.dt
         
         fig, axes = plt.subplots(5, 1, figsize=(10, 10))
+        title = "Cart-Pole Simulation"
         
         # Position
         axes[0].plot(time, x_traj[:, 0], 'b-', linewidth=2)
@@ -265,7 +269,7 @@ class CartPole:
         
         return x_traj, u_traj
     
-    def animate(self, x0, control_policy, N, interval=50, save_path=None, title="Cart-Pole Animation"):
+    def animate(self, x0, control_policy, interval=50, save_path=None, title="Cart-Pole Animation"):
         """Animate the cart-pole system.
         
         Parameters
@@ -294,12 +298,12 @@ class CartPole:
             The animation object.
         """
         # First, simulate to get the trajectory
-        x_traj = np.zeros((N + 1, 4))
-        u_traj = np.zeros(N)
+        x_traj = np.zeros((self.N + 1, 4))
+        u_traj = np.zeros(self.N)
         
         x_traj[0] = np.array(x0).flatten()
         
-        for k in range(N):
+        for k in range(self.N):
             if control_policy is None:
                 u_k = self.solve_MPC(x_traj[k])  # Solve MPC to get control input for current state
             elif callable(control_policy):
@@ -376,7 +380,7 @@ class CartPole:
             
             return cart, pole, time_text
         
-        anim = FuncAnimation(fig, update, frames=N+1, init_func=init,
+        anim = FuncAnimation(fig, update, frames=self.N+1, init_func=init,
                            blit=True, interval=interval, repeat=True)
         
         plt.show()
@@ -398,20 +402,21 @@ if __name__ == "__main__":
     v_bound = 2.0
     theta_bound = np.pi/6
     omega_bound = 1.0
+    np.random.seed(42)  # for reproducibility
     p0 = np.random.uniform(-p_bound, p_bound)
     v0 = np.random.uniform(-v_bound, v_bound)
     theta0 = np.random.uniform(-theta_bound, theta_bound)
     omega0 = np.random.uniform(-omega_bound, omega_bound)
     x0 = [p0, v0, theta0, omega0]
     print (f"Initial state: {x0}")
-    N = 20  # number of simulation steps
     control_policy = lambda x: np.array([0.0])  # zero control input
     
-    cart_pole.simulate_and_plot(x0, control_policy=None, N=N, title="Cart-Pole Simulation with MPC")
+    # Close-loop simulation with MPC control
+    cart_pole.close_loop_simulation(x0)
     # Animate
     # x0 = [0.0, 0.0, np.pi/6, 0.0]  # Small initial angle
     x_traj, u_traj, anim = cart_pole.animate(
-        x0, control_policy=None, N=100, 
+        x0, control_policy=None, 
         interval=50,  # 50ms between frames
         # save_path='cart_pole.gif'  # Optional: save to file
 )
