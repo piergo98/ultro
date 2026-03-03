@@ -789,7 +789,7 @@ class InvertedPendulumMPCInputCollocation:
 def main():
     # Configure the problem
     mpc = InvertedPendulumMPCInputCollocation(
-        layer_sizes=[2, 20, 10],
+        layer_sizes=[2, 40, 10],
         batch_size=40,
         horizon=10,
         degree=3,

@@ -10,7 +10,7 @@ import numpy as np
 from scipy.linalg import solve_discrete_are, solve_continuous_are
 
 from csnn import set_sym_type, Linear, Sequential, ReLU, Softplus
-from learning_problem.models.cart_pole import CartPole
+from models.cart_pole import CartPole
 
 
 def get_model_name(layer_sizes):
@@ -46,7 +46,7 @@ def find_latest_params(model_dir, model_name, extension="yaml"):
     latest_file : Path or None
         Path to the most recent parameter file, or None if not found.
     """
-    pattern = f"optimal_params_cp_input{model_name}_*.{extension}"
+    pattern = f"optimal_params_cp_{model_name}_*.{extension}"
     files = list(model_dir.glob(pattern))
     if not files:
         return None
@@ -118,7 +118,7 @@ class CartPoleMPCComparison:
         self.layer_sizes = layer_sizes
         self.beta = beta
         self.N = horizon
-        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent / "models"
+        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn"
         
         # Initialize cart-pole model
         self.cart_pole = CartPole(sym_type='SX')
@@ -273,7 +273,11 @@ class CartPoleMPCComparison:
         x_eq = ca.DM([0.0, 0.0, 0.0, 0.0])  # equilibrium state (upright pole)
         u_eq = ca.DM([0.0])                 # equilibrium control input
         A, B = self.cart_pole.lin_dyn(x_eq, u_eq)
+        self.A = A
+        self.B = B
         self.E = solve_continuous_are(A.full(), B.full(), self.Q.full(), self.R.full())
+        # Compute LQR gain matrix: K = R^{-1} * B^T * E
+        self.K = np.linalg.solve(self.R.full(), self.B.full().T @ self.E)
         J += (Xk - self.xr).T @ ca.DM(self.E) @ (Xk - self.xr)
         
         # Store bounds
@@ -284,7 +288,7 @@ class CartPoleMPCComparison:
         
         # Create NLP solver
         nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g)}
-        opts = {"expand": False, "ipopt": {"print_level": 0, "max_iter": 3000, "tol": 1e-8}}
+        opts = {"expand": False, "print_time": False, "ipopt": {"print_level": 0, "max_iter": 3000, "tol": 1e-8}}
         self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
     
     def generate_test_states(self, n_test=20, seed=42):
@@ -298,16 +302,17 @@ class CartPoleMPCComparison:
             Random seed for reproducibility.
         """
         np.random.seed(seed)
-        p_test_bound = 0.5
-        v_test_bound = 2.0
-        theta_test_bound = np.pi/8
-        omega_test_bound = 1.0
+        alpha = 0.3  # scaling factor to ensure test states are within training distribution
+        self.p_test_bound = self.p_bound * alpha
+        self.v_test_bound = self.v_bound * alpha
+        self.theta_test_bound = self.theta_bound * alpha
+        self.omega_test_bound = self.omega_bound * alpha
         
         self.initial_states = np.zeros((n_test, self.NX))
-        self.initial_states[:, 0] = np.random.uniform(-p_test_bound, p_test_bound, n_test)
-        self.initial_states[:, 1] = np.random.uniform(-v_test_bound, v_test_bound, n_test)
-        self.initial_states[:, 2] = np.random.uniform(-theta_test_bound, theta_test_bound, n_test)
-        self.initial_states[:, 3] = np.random.uniform(-omega_test_bound, omega_test_bound, n_test)
+        self.initial_states[:, 0] = np.random.uniform(-self.p_test_bound, self.p_test_bound, n_test)
+        self.initial_states[:, 1] = np.random.uniform(-self.v_test_bound, self.v_test_bound, n_test)
+        self.initial_states[:, 2] = np.random.uniform(-self.theta_test_bound, self.theta_test_bound, n_test)
+        self.initial_states[:, 3] = np.random.uniform(-self.omega_test_bound, self.omega_test_bound, n_test)
         
         print(f"Generated {n_test} uniformly sampled initial states")
     
@@ -379,7 +384,8 @@ class CartPoleMPCComparison:
             u_sim = np.zeros((self.NU, self.N))
             x_sim[:, 0] = x0
             for k in range(self.N):
-                u_sim[:, k] = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()
+                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
+                u_sim[:, k] = u_next
                 x_next, _ = self.f_dyn(x_sim[:, k], u_sim[:, k])
                 x_sim[:, k + 1] = x_next.full().flatten()
             
@@ -694,6 +700,187 @@ class CartPoleMPCComparison:
         plt.suptitle(f'Cost Function Analysis ({N_VALID} Valid Test Cases)', fontsize=14)
         plt.tight_layout(rect=[0, 0, 1, 0.96])
     
+    def plot_policy(self):
+        """Plot learned policy vs optimal control vs LQR.
+        
+        Plots control as a function of angle, with other states fixed at zero
+        (position=0, velocity=0, angular_velocity=0).
+        """
+        # Create a grid of position for plotting the policy
+        grid = np.linspace(-self.theta_test_bound, self.theta_test_bound, 50)
+
+        # Compute optimal control, learned control, and LQR control on the grid
+        U_opt_grid = np.zeros(grid.shape[0])
+        U_learned_grid = np.zeros(grid.shape[0])
+        U_lqr_grid = np.zeros(grid.shape[0])
+
+        for i in range(grid.shape[0]):
+            # State: [position, velocity, angle, angular_velocity]
+            x_i = np.array([0.0, 0.0, grid[i], 0.0])
+            
+            # Solve MPC for this state to get optimal control
+            lbw_i = self.lbw.copy()
+            ubw_i = self.ubw.copy()
+            lbw_i[:self.NX] = x_i.tolist()
+            ubw_i[:self.NX] = x_i.tolist()
+            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
+            w_opt = solution['x'].full().flatten()
+            _, u_opt_traj = self.extract_traj(w_opt)
+            U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
+
+            # Compute learned control
+            U_learned_grid[i] = self.net_fcn(x_i.tolist(), self.params_init_vec).full().flatten()[0]
+            
+            # Compute LQR control: u = -K * (x - x_ref)
+            x_ref = self.xr.full().flatten()
+            U_lqr_grid[i] = (-self.K @ (x_i - x_ref))[0]
+
+        # Reshape for plotting
+        U_opt_grid = U_opt_grid.reshape(grid.shape)
+        U_learned_grid = U_learned_grid.reshape(grid.shape)
+        U_lqr_grid = U_lqr_grid.reshape(grid.shape)
+        
+        # Compute errors
+        U_error_learned = np.abs(U_opt_grid - U_learned_grid)
+        U_error_lqr = np.abs(U_opt_grid - U_lqr_grid)
+
+        fig = plt.figure(figsize=(16, 10))
+        
+        # First row: Optimal, Learned, and LQR policies
+        ax1 = fig.add_subplot(2, 3, 1)
+        ax1.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
+        ax1.set_title('Optimal Control Policy')
+        ax1.set_xlabel('Angle (rad)')
+        ax1.set_ylabel('Control Force (N)')
+        ax1.grid(True)
+        ax1.legend()
+
+        ax2 = fig.add_subplot(2, 3, 2)
+        ax2.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, label='Learned NN')
+        ax2.set_title(f'Learned Control Policy')
+        ax2.set_xlabel('Angle (rad)')
+        ax2.set_ylabel('Control Force (N)')
+        ax2.grid(True)
+        ax2.legend()
+        
+        ax3 = fig.add_subplot(2, 3, 3)
+        ax3.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, label='LQR')
+        ax3.set_title('LQR Control Policy')
+        ax3.set_xlabel('Angle (rad)')
+        ax3.set_ylabel('Control Force (N)')
+        ax3.grid(True)
+        ax3.legend()
+        
+        # Second row: Comparison and errors
+        ax4 = fig.add_subplot(2, 3, 4)
+        ax4.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
+        ax4.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, linestyle='--', label='Learned NN')
+        ax4.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, linestyle=':', label='LQR')
+        ax4.set_title('All Policies Comparison')
+        ax4.set_xlabel('Angle (rad)')
+        ax4.set_ylabel('Control Force (N)')
+        ax4.grid(True)
+        ax4.legend()
+        
+        ax5 = fig.add_subplot(2, 3, 5)
+        ax5.semilogy(grid, U_error_learned.flatten(), alpha=0.7, color='C2', linewidth=2, label='Learned error')
+        ax5.set_title('|Optimal - Learned| (log scale)')
+        ax5.set_xlabel('Angle (rad)')
+        ax5.set_ylabel('|Error| (N)')
+        ax5.grid(True, which='both')
+        ax5.legend()
+        
+        ax6 = fig.add_subplot(2, 3, 6)
+        ax6.semilogy(grid, U_error_lqr.flatten(), alpha=0.7, color='C4', linewidth=2, label='LQR error')
+        ax6.set_title('|Optimal - LQR| (log scale)')
+        ax6.set_xlabel('Angle (rad)')
+        ax6.set_ylabel('|Error| (N)')
+        ax6.grid(True, which='both')
+        ax6.legend()
+
+        plt.tight_layout()
+    
+    def plot_policy_3d(self, elev=30, azim=-60):
+        """3D surface plot of optimal, learned, and LQR control policies.
+        
+        Plots control as a function of angle and angular velocity, with other states
+        fixed at zero (position=0, velocity=0).
+
+        Parameters
+        ----------
+        elev : float
+            Elevation angle for 3D view.
+        azim : float
+            Azimuth angle for 3D view.
+        """
+        # Create a grid of states for plotting the policy
+        theta_grid = np.linspace(-self.theta_bound, self.theta_bound, 50)
+        omega_grid = np.linspace(-self.omega_bound, self.omega_bound, 50)
+        Theta, Omega = np.meshgrid(theta_grid, omega_grid)
+        X_grid = np.vstack([Theta.flatten(), Omega.flatten()])
+
+        # Compute optimal control, learned control, and LQR control on the grid
+        U_opt_grid = np.zeros(X_grid.shape[1])
+        U_learned_grid = np.zeros(X_grid.shape[1])
+        U_lqr_grid = np.zeros(X_grid.shape[1])
+
+        for i in range(X_grid.shape[1]):
+            # State: [position, velocity, angle, angular_velocity]
+            x_i = np.array([0.0, 0.0, X_grid[0, i], X_grid[1, i]])
+            
+            # Solve MPC for this state to get optimal control
+            lbw_i = self.lbw.copy()
+            ubw_i = self.ubw.copy()
+            lbw_i[:self.NX] = x_i.tolist()
+            ubw_i[:self.NX] = x_i.tolist()
+            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
+            w_opt = solution['x'].full().flatten()
+            _, u_opt_traj = self.extract_traj(w_opt)
+            U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
+
+            # Compute learned control
+            U_learned_grid[i] = self.net_fcn(x_i.tolist(), self.params_init_vec).full().flatten()[0]
+            
+            # Compute LQR control: u = -K * (x - x_ref)
+            x_ref = self.xr.full().flatten()
+            U_lqr_grid[i] = (-self.K @ (x_i - x_ref))[0]
+
+        # Reshape for plotting
+        U_opt_grid = U_opt_grid.reshape(Theta.shape)
+        U_learned_grid = U_learned_grid.reshape(Theta.shape)
+        U_lqr_grid = U_lqr_grid.reshape(Theta.shape)
+
+        fig = plt.figure(figsize=(18, 6))
+        
+        ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+        surf1 = ax1.plot_surface(Theta, Omega, U_opt_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
+        fig.colorbar(surf1, ax=ax1, shrink=0.6)
+        ax1.set_title('Optimal Control Policy (3D)')
+        ax1.set_xlabel('Angle (rad)')
+        ax1.set_ylabel('Angular Velocity (rad/s)')
+        ax1.set_zlabel('Control Force (N)')
+        ax1.view_init(elev=elev, azim=azim)
+
+        ax2 = fig.add_subplot(1, 3, 2, projection='3d')
+        surf2 = ax2.plot_surface(Theta, Omega, U_learned_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
+        fig.colorbar(surf2, ax=ax2, shrink=0.6)
+        ax2.set_title(f'Learned Policy (3D)')
+        ax2.set_xlabel('Angle (rad)')
+        ax2.set_ylabel('Angular Velocity (rad/s)')
+        ax2.set_zlabel('Control Force (N)')
+        ax2.view_init(elev=elev, azim=azim)
+        
+        ax3 = fig.add_subplot(1, 3, 3, projection='3d')
+        surf3 = ax3.plot_surface(Theta, Omega, U_lqr_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
+        fig.colorbar(surf3, ax=ax3, shrink=0.6)
+        ax3.set_title('LQR Control Policy (3D)')
+        ax3.set_xlabel('Angle (rad)')
+        ax3.set_ylabel('Angular Velocity (rad/s)')
+        ax3.set_zlabel('Control Force (N)')
+        ax3.view_init(elev=elev, azim=azim)
+
+        plt.tight_layout()
+    
     def show_plots(self):
         """Display all plots."""
         plt.show()
@@ -702,13 +889,13 @@ class CartPoleMPCComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = CartPoleMPCComparison(
-        layer_sizes=[4, 20, 1],
-        beta=0.5,
+        layer_sizes=[4, 30, 20],
+        beta=50.0,
         horizon=20
     )
     
     # Generate test states
-    comparison.generate_test_states(n_test=20, seed=42)
+    comparison.generate_test_states(n_test=200, seed=42)
     
     # Run comparison
     comparison.run_comparison(wait_for_input=True)
@@ -718,6 +905,8 @@ if __name__ == "__main__":
     
     # Generate plots
     comparison.plot_trajectories()
+    comparison.plot_policy()
+    # comparison.plot_policy_3d()
     comparison.plot_errors()
-    comparison.plot_costs()
+    # comparison.plot_costs()
     comparison.show_plots()

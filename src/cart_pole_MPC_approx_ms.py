@@ -99,13 +99,12 @@ class CartPoleMPCInputVar:
         self.u_min = -25.0
         self.u_max = 25.0
         
-        # Parameter bounds
-        self.param_min = -50.0
-        self.param_max = 50.0
+        # Parameter bound
+        self.param_bound = 50.0
         
         # Setup model directory
         if model_dir is None:
-            self.model_dir = Path(__file__).parent / "models"
+            self.model_dir = Path(__file__).parent.parent / "models_nn"
         else:
             self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -234,6 +233,71 @@ class CartPoleMPCInputVar:
         print("Using Kaiming (He) initialization.")
         return self.parameter_initialization_he()
     
+    def generate_intial_states(self):
+        """Generate initial states for training."""
+        self.X_train = np.random.uniform(
+            low=np.array([-self.p_train_bound, -self.v_train_bound, -self.theta_train_bound, -self.omega_train_bound]).reshape(-1, 1),
+            high=np.array([self.p_train_bound, self.v_train_bound, self.theta_train_bound, self.omega_train_bound]).reshape(-1, 1),
+            size=(self.NX, self.NB)
+        )
+        
+    def network_warm_start_with_sgd(self, params_init, learning_rate=1e-3, num_samples=20, iterations=1000):
+        """Warm start network parameters using simple SGD on a surrogate loss.
+        
+        Parameters
+        ----------
+        params_init : np.ndarray
+            Initial parameters to warm start from.
+        learning_rate : float
+            Learning rate for SGD.
+        num_samples : int
+            Number of samples to use for training.
+        iterations : int    
+            Number of SGD iterations.
+            
+        Returns
+        -------
+        params_warm : np.ndarray
+            Warm-started parameters after SGD.
+        """
+        print("Starting network warm start with SGD...")
+        
+        # Extarct the first num_samples training data for surrogate loss
+        X_train = self.X_train[:, :num_samples]
+        
+        # Rollout the MPC 
+        U_target = []
+        for i in range(num_samples):
+            u_opt = self.cart_pole.solve_MPC(X_train[:, i])
+            U_target.append(u_opt)
+        
+        U_target = np.array(U_target).reshape(self.NU, num_samples)
+        
+        # Forward pass
+        F = self.net_fcn.map(num_samples)
+        U_pred = F(X_train, self.params_flattened)
+        
+        # Compute loss (MSE) and its gradient
+        loss = ca.sqrt(ca.sumsqr(U_pred - U_target)) / num_samples + self.regularization * ca.dot(self.params_flattened, self.params_flattened)
+        loss_fcn = ca.Function('loss_fcn', [self.params_flattened], [loss])
+        grad = ca.gradient(loss, self.params_flattened)
+        grad_fcn = ca.Function('grad_fcn', [self.params_flattened], [grad])
+        
+        # SGD loop
+        params = params_init.copy()
+        for it in range(iterations):    
+            grad_val = grad_fcn(params.reshape(-1, 1)).full().flatten()
+            params -= learning_rate * grad_val
+            
+            if (it + 1) % 50 == 0 or it == 0:
+                u_pred = F(X_train, params)
+                loss_val = loss_fcn(params.reshape(-1, 1)).full().item()
+                print(f"SGD iteration {it + 1}/{iterations}, Loss: {loss_val:.4f}, Grad Norm: {np.linalg.norm(grad_val):.4f}")
+                # print(f"Sample predictions: {u_pred.full().flatten()[:5]}, Targets: {U_target.flatten()[:5]}")
+        
+        print("Network warm start complete.")
+        return params
+    
     def setup_optimization(self, params_init=None):
         """Set up the NLP optimization problem.
         
@@ -279,18 +343,13 @@ class CartPoleMPCInputVar:
         # Add consensus parameters as decision variables
         z = ca.SX.sym('z', self.n_param)
         w += [z]
-        lbw += [self.param_min] * self.n_param
-        ubw += [self.param_max] * self.n_param
+        lbw += [-self.param_bound] * self.n_param
+        ubw += [self.param_bound] * self.n_param
         w0 += params_init.tolist()
         
         # Define one NLP for each batch element
         for i in range(self.NB):
-            # Generate random initial state for this batch element
-            p0 = np.random.uniform(-self.p_train_bound, self.p_train_bound)
-            v0 = np.random.uniform(-self.v_train_bound, self.v_train_bound)
-            theta0 = np.random.uniform(-self.theta_train_bound, self.theta_train_bound)
-            omega0 = np.random.uniform(-self.omega_train_bound, self.omega_train_bound)
-            x0 = [p0, v0, theta0, omega0]
+            x0 = self.X_train[:, i].tolist()
             
             # Initial state
             Xk = ca.SX.sym('X_' + str(i) + '_0', self.NX)
@@ -311,7 +370,7 @@ class CartPoleMPCInputVar:
                 w0 += [0.0] * self.NU
                 
                 # Add constraint on control input as function approximator
-                g += [u_k - self.net_fcn(Xk, z)]
+                g += [u_k - self.net_fcn(Xk, z)[k]]
                 lbg += [0.0] * self.NU
                 ubg += [0.0] * self.NU
                 
@@ -370,7 +429,9 @@ class CartPoleMPCInputVar:
                 "tol": 1e-5,
                 "hsllib": "/home/pietro/ThirdParty-HSL/coinhsl-2024.05.15/install/lib/x86_64-linux-gnu/libcoinhsl.so",
                 "linear_solver": "ma86",
-                # "mu_strategy": "adaptive",
+                # "warm_start_init_point": "yes",
+                # "warm_start_bound_push": 1e-6,
+                # "warm_start_bound_frac": 1e-6,
             }
         }
         self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
@@ -389,7 +450,17 @@ class CartPoleMPCInputVar:
             lbg=self.lbg,
             ubg=self.ubg
         )
-        print("NLP solved.")
+        
+        if self.solver.stats()['success']:
+            print("\nOptimization successful!")
+        else:
+            # Print maximum constraint violation for debugging
+            g_sol = self.solution['g'].full().flatten()
+            max_violation = np.max(np.abs(g_sol))
+            max_violation_idx = np.argmax(np.abs(g_sol))
+            print(f"\nOptimization failed. Maximum constraint violation: {max_violation}")
+            print(f"Index of maximum violation: {max_violation_idx}")
+            raise RuntimeError("Optimization failed. Check constraint violations for debugging.")
         
         # Extract solution
         self.extract_solution()
@@ -507,18 +578,19 @@ class CartPoleMPCInputVar:
             "layer_sizes": self.layer_sizes,
             "model_name": self.model_name,
             "batch_size": int(self.NB),
+            "beta": float(self.beta),
             "horizon": int(self.N),
             "date": date_str
         }
         
         # Save JSON
-        json_path = self.model_dir / f"optimal_params_cp_input{self.model_name}_{date_str}.json"
+        json_path = self.model_dir / f"optimal_params_cp_{self.model_name}_{date_str}.json"
         with json_path.open("w") as f:
             json.dump(params_dict, f, indent=2)
         print(f"Saved parameters to {json_path}")
         
         # Save YAML
-        yaml_path = self.model_dir / f"optimal_params_cp_input{self.model_name}_{date_str}.yaml"
+        yaml_path = self.model_dir / f"optimal_params_cp_{self.model_name}_{date_str}.yaml"
         with yaml_path.open("w") as f:
             yaml.safe_dump(params_dict, f)
         print(f"Saved parameters to {yaml_path}")
@@ -612,7 +684,7 @@ class CartPoleMPCInputVar:
         latest_file : Path or None
             Path to the most recent parameter file, or None if not found.
         """
-        pattern = f"optimal_params_cp_input{model_name}_*.{extension}"
+        pattern = f"optimal_params_cp_{model_name}_*.{extension}"
         files = list(model_dir.glob(pattern))
         if not files:
             return None
@@ -624,20 +696,26 @@ def main():
     """Main function demonstrating usage of the CartPoleMPCInputVar class."""
     # Configure the problem
     mpc = CartPoleMPCInputVar(
-        layer_sizes=[4, 10, 1],
+        layer_sizes=[4, 30, 20],
         batch_size=40,
         horizon=20,
         rk4_steps=4,
-        beta=0.5,
+        beta=2.0,
         q_weights=[100, 1, 30, 1],
-        r_weight=0.01,
+        r_weight=1.0,
         regularization=1e-4,
         seed=42,
-        use_jit=True
+        use_jit=False
     )
     
+    mpc.generate_intial_states()
+    
+    # Initialize params with warm start
+    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
+    warm_params = None
+    
     # Setup and solve the optimization problem
-    mpc.setup_optimization()
+    mpc.setup_optimization(warm_params)
     mpc.solve()
     
     # Visualize results
