@@ -138,7 +138,7 @@ class CartPoleMPCInputCollocation:
         for i in range(len(self.layer_sizes) - 1):
             layers.append(Linear(self.layer_sizes[i], self.layer_sizes[i + 1]))
             if i < len(self.layer_sizes) - 2:  # add activation for all but last layer
-                layers.append(ReLU())
+                layers.append(Softplus(beta=self.beta))
         
         self.net = Sequential[ca.SX](tuple(layers))
         self.n_param = self.net.num_parameters
