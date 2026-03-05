@@ -889,8 +889,8 @@ class CartPoleMPCComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = CartPoleMPCComparison(
-        layer_sizes=[4, 30, 20],
-        beta=50.0,
+        layer_sizes=[4, 40, 20],
+        beta=20.0,
         horizon=20
     )
     

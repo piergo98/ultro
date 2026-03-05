@@ -273,7 +273,11 @@ class InvertedPendulumMPCComparison:
         x_eq = ca.DM([0.0, 0.0])  # equilibrium state (upright pendulum)
         u_eq = ca.DM([0.0])                 # equilibrium control input
         A, B = self.inverted_pendulum.lin_dyn(x_eq, u_eq)
+        self.A = A
+        self.B = B
         self.E = solve_continuous_are(A.full(), B.full(), self.Q.full(), self.R.full())
+        # Compute LQR gain matrix: K = R^{-1} * B^T * E
+        self.K = np.linalg.inv(self.R.full()) @ B.T @ self.E
         J += (Xk - self.xr).T @ ca.DM(self.E) @ (Xk - self.xr)
         
         # Store bounds
@@ -298,12 +302,13 @@ class InvertedPendulumMPCComparison:
             Random seed for reproducibility.
         """
         np.random.seed(seed)
-        theta_test_bound = np.pi/6
-        omega_test_bound = 1.0
+        alpha = 0.5  # scaling factor to ensure test states are within training distribution
+        self.theta_test_bound = self.theta_bound * alpha
+        self.omega_test_bound = self.omega_bound * alpha
         
         self.initial_states = np.zeros((n_test, self.NX))
-        self.initial_states[:, 0] = np.random.uniform(-theta_test_bound, theta_test_bound, n_test)
-        self.initial_states[:, 1] = np.random.uniform(-omega_test_bound, omega_test_bound, n_test)
+        self.initial_states[:, 0] = np.random.uniform(-self.theta_test_bound, self.theta_test_bound, n_test)
+        self.initial_states[:, 1] = np.random.uniform(-self.omega_test_bound, self.omega_test_bound, n_test)
         
         print(f"Generated {n_test} uniformly sampled initial states")
     
@@ -540,62 +545,101 @@ class InvertedPendulumMPCComparison:
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         
     def plot_policy(self):
-        """Plot learned policy vs optimal control."""
+        """Plot learned policy vs optimal control vs LQR.
         
-        # Create a grid of states for plotting the policy
-        theta_grid = np.linspace(-self.theta_bound, self.theta_bound, 50)
-        # omega_grid = np.linspace(-self.omega_bound, self.omega_bound, 50)
+        Plots control as a function of angle, with angular velocity fixed at zero.
+        """
+        # Create a grid of angle for plotting the policy
+        grid = np.linspace(-self.theta_test_bound, self.theta_test_bound, 50)
 
-        # Compute optimal control and learned control on the grid
-        U_opt_grid = np.zeros(theta_grid.shape[0])
-        U_learned_grid = np.zeros(theta_grid.shape[0])
+        # Compute optimal control, learned control, and LQR control on the grid
+        U_opt_grid = np.zeros(grid.shape[0])
+        U_learned_grid = np.zeros(grid.shape[0])
+        U_lqr_grid = np.zeros(grid.shape[0])
 
-        for i in range(theta_grid.shape[0]):
-            x_i = [theta_grid[i], 0.0]  # zero angular velocity slice
+        for i in range(grid.shape[0]):
+            # State: [angle, angular_velocity]
+            x_i = np.array([grid[i], 0.0])
+            
             # Solve MPC for this state to get optimal control
             lbw_i = self.lbw.copy()
             ubw_i = self.ubw.copy()
-            lbw_i[:self.NX] = x_i
-            ubw_i[:self.NX] = x_i
+            lbw_i[:self.NX] = x_i.tolist()
+            ubw_i[:self.NX] = x_i.tolist()
             solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
             w_opt = solution['x'].full().flatten()
             _, u_opt_traj = self.extract_traj(w_opt)
             U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
 
             # Compute learned control
-            U_learned_grid[i] = self.net_fcn(x_i, self.params_init_vec).full().flatten()[0]
+            U_learned_grid[i] = self.net_fcn(x_i.tolist(), self.params_init_vec).full().flatten()[0]
+            
+            # Compute LQR control: u = -K * (x - x_ref)
+            x_ref = self.xr.full().flatten()
+            U_lqr_grid[i] = (-self.K @ (x_i - x_ref))[0]
 
         # Reshape for plotting
-        U_opt_grid = U_opt_grid.reshape(theta_grid.shape)
-        U_learned_grid = U_learned_grid.reshape(theta_grid.shape)
+        U_opt_grid = U_opt_grid.reshape(grid.shape)
+        U_learned_grid = U_learned_grid.reshape(grid.shape)
+        U_lqr_grid = U_lqr_grid.reshape(grid.shape)
         
-        # Compute error
-        U_error = np.abs(U_opt_grid - U_learned_grid)
+        # Compute errors
+        U_error_learned = np.abs(U_opt_grid - U_learned_grid)
+        U_error_lqr = np.abs(U_opt_grid - U_lqr_grid)
 
-        fig = plt.figure(figsize=(14, 8))
+        fig = plt.figure(figsize=(16, 10))
         
-        # First row: Optimal and Learned policies side by side
-        ax1 = fig.add_subplot(2, 2, 1)
-        ax1.plot(theta_grid, U_opt_grid.flatten(), alpha=0.5, color='C0', linewidth=2)
+        # First row: Optimal, Learned, and LQR policies
+        ax1 = fig.add_subplot(2, 3, 1)
+        ax1.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
         ax1.set_title('Optimal Control Policy')
         ax1.set_xlabel('Angle (rad)')
-        ax1.set_ylabel('Control')
+        ax1.set_ylabel('Control Torque (Nm)')
         ax1.grid(True)
+        ax1.legend()
 
-        ax2 = fig.add_subplot(2, 2, 2)
-        ax2.plot(theta_grid, U_learned_grid.flatten(), alpha=0.5, color='C1', linewidth=2)
+        ax2 = fig.add_subplot(2, 3, 2)
+        ax2.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, label='Learned NN')
         ax2.set_title(f'Learned Control Policy')
         ax2.set_xlabel('Angle (rad)')
-        ax2.set_ylabel('Control')
+        ax2.set_ylabel('Control Torque (Nm)')
         ax2.grid(True)
+        ax2.legend()
         
-        # Second row: Error plot spanning the width
-        ax3 = fig.add_subplot(2, 1, 2)
-        ax3.semilogy(theta_grid, U_error.flatten(), alpha=0.7, color='C2', linewidth=2)
-        ax3.set_title('|Control Error| (log scale)')
+        ax3 = fig.add_subplot(2, 3, 3)
+        ax3.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, label='LQR')
+        ax3.set_title('LQR Control Policy')
         ax3.set_xlabel('Angle (rad)')
-        ax3.set_ylabel('|Optimal - Learned|')
-        ax3.grid(True, which='both')
+        ax3.set_ylabel('Control Torque (Nm)')
+        ax3.grid(True)
+        ax3.legend()
+        
+        # Second row: Comparison and errors
+        ax4 = fig.add_subplot(2, 3, 4)
+        ax4.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
+        ax4.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, linestyle='--', label='Learned NN')
+        ax4.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, linestyle=':', label='LQR')
+        ax4.set_title('All Policies Comparison')
+        ax4.set_xlabel('Angle (rad)')
+        ax4.set_ylabel('Control Torque (Nm)')
+        ax4.grid(True)
+        ax4.legend()
+        
+        ax5 = fig.add_subplot(2, 3, 5)
+        ax5.semilogy(grid, U_error_learned.flatten(), alpha=0.7, color='C2', linewidth=2, label='Learned error')
+        ax5.set_title('|Optimal - Learned| (log scale)')
+        ax5.set_xlabel('Angle (rad)')
+        ax5.set_ylabel('|Error| (Nm)')
+        ax5.grid(True, which='both')
+        ax5.legend()
+        
+        ax6 = fig.add_subplot(2, 3, 6)
+        ax6.semilogy(grid, U_error_lqr.flatten(), alpha=0.7, color='C4', linewidth=2, label='LQR error')
+        ax6.set_title('|Optimal - LQR| (log scale)')
+        ax6.set_xlabel('Angle (rad)')
+        ax6.set_ylabel('|Error| (Nm)')
+        ax6.grid(True, which='both')
+        ax6.legend()
 
         plt.tight_layout()
     
