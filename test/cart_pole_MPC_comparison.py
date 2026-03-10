@@ -54,18 +54,21 @@ def find_latest_params(model_dir, model_name, extension="yaml"):
     return latest_file
 
 
-def load_params(params_file):
+def load_params(params_file, return_metadata=False):
     """Load optimal parameters from a file.
 
     Parameters
     ----------
     params_file : str or Path
         Path to the file containing the optimal parameters (JSON or YAML).
+    return_metadata : bool
+        If True, return a dict with all metadata. If False, return only parameters.
 
     Returns
     -------
-    params_init : np.ndarray
-        Flattened array of initialized parameters.
+    params_init : np.ndarray or dict
+        If return_metadata is False: Flattened array of initialized parameters.
+        If return_metadata is True: Dict with 'params', 'q_weights', 'r_weight', and other metadata.
     """
     params_path = Path(params_file)
     if not params_path.is_file():
@@ -90,14 +93,25 @@ def load_params(params_file):
         params_init_vec = np.concatenate([params_init_vec, np.zeros(n_param - params_init_vec.size)])
     elif params_init_vec.size > n_param:
         params_init_vec = params_init_vec[:n_param]
-        
-    return params_init_vec
+    
+    if return_metadata:
+        return {
+            'params': params_init_vec,
+            'q_weights': data.get('q_weights'),
+            'r_weight': data.get('r_weight'),
+            'beta': data.get('beta'),
+            'horizon': data.get('horizon'),
+            'layer_sizes': data.get('layer_sizes'),
+            'batch_size': data.get('batch_size')
+        }
+    else:
+        return params_init_vec
 
 
 class CartPoleMPCComparison:
     """Class for comparing optimal MPC with learned neural network policy for cart-pole system."""
     
-    def __init__(self, layer_sizes=[4, 20, 1], beta=0.5, horizon=20, model_dir=None):
+    def __init__(self, layer_sizes=[4, 20, 1], beta=0.5, horizon=20, model_dir=None, wait_for_input=True):
         """Initialize the MPC comparison.
         
         Parameters
@@ -110,6 +124,8 @@ class CartPoleMPCComparison:
             MPC prediction horizon length.
         model_dir : Path or None
             Directory containing trained model parameters.
+        wait_for_input : bool
+            If True, wait for user input before starting testing.
         """
         print("Setting up the MPC problem for testing...")
         start_time = time.time()
@@ -130,9 +146,6 @@ class CartPoleMPCComparison:
         # Set up neural network
         self._setup_network()
         
-        # Set up MPC problem
-        self._setup_mpc()
-        
         # Storage for results
         self.initial_states = None
         self.x_opt_batch = []
@@ -144,6 +157,18 @@ class CartPoleMPCComparison:
         self.cost_opt_batch = []
         self.cost_sim_batch = []
         self.valid_indices = []
+        
+        # if self.initial_states is None:
+        #     raise ValueError("Generate test states first using generate_test_states()")
+        
+        if not hasattr(self, 'params_init_vec'):
+            self.load_learned_params()
+        
+        if wait_for_input:
+            input("Press Enter to start testing...")
+        
+        # Set up MPC problem
+        self._setup_mpc()
         
         print(f"Setup completed in {time.time() - start_time:.2f} seconds")
     
@@ -206,8 +231,8 @@ class CartPoleMPCComparison:
         # Define dynamics and stage cost
         x = ca.SX.sym('x', self.NX)
         u = ca.SX.sym('u', self.NU)
-        self.Q = ca.diag(ca.DM([100, 1, 30, 1]))  # state cost weights
-        self.R = ca.diag(ca.DM([0.01]))  # control cost weight
+        # self.Q = ca.diag(ca.DM([100, 1, 30, 1]))  # state cost weights
+        # self.R = ca.diag(ca.DM([1.0]))  # control cost weight
         x_dot = self.cart_pole.dynamics(x, u)
         self.xr = ca.DM([0.0, 0.0, 0.0, 0.0])  # reference state (upright pole)
         self.ur = ca.DM([0.0])                  # reference control input
@@ -238,6 +263,10 @@ class CartPoleMPCComparison:
         self.theta_bound = np.pi/3
         self.omega_bound = 2.0
         
+        # Control bounds
+        self.u_min = -10.0
+        self.u_max = 10.0
+        
         # Initialize state as symbolic parameter
         Xk = ca.SX.sym('X_0', self.NX)
         w += [Xk]
@@ -248,8 +277,8 @@ class CartPoleMPCComparison:
         for k in range(self.N):
             u_k = ca.SX.sym('u_' + str(k), self.NU)
             w += [u_k]
-            lbw += [-25.0]*self.NU
-            ubw += [25.0]*self.NU
+            lbw += [self.u_min]*self.NU
+            ubw += [self.u_max]*self.NU
             self.w0 += [0.0]*self.NU
             
             # Compute next state
@@ -302,7 +331,7 @@ class CartPoleMPCComparison:
             Random seed for reproducibility.
         """
         np.random.seed(seed)
-        alpha = 0.3  # scaling factor to ensure test states are within training distribution
+        alpha = 0.2  # scaling factor to ensure test states are within training distribution
         self.p_test_bound = self.p_bound * alpha
         self.v_test_bound = self.v_bound * alpha
         self.theta_test_bound = self.theta_bound * alpha
@@ -322,25 +351,24 @@ class CartPoleMPCComparison:
         params_file = find_latest_params(self.model_dir, model_name, "yaml")
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
-        self.params_init_vec = load_params(params_file)
+        
+        # Load parameters and metadata
+        param_data = load_params(params_file, return_metadata=True)
+        self.params_init_vec = param_data['params']
+        
+        # Load Q and R weights from file
+        if param_data['q_weights'] is not None:
+            self.Q = ca.diag(ca.DM(param_data['q_weights']))
+            print(f"Loaded Q weights from file: {param_data['q_weights']}")
+        
+        if param_data['r_weight'] is not None:
+            self.R = ca.diag(ca.DM([param_data['r_weight']]))
+            print(f"Loaded R weight from file: {param_data['r_weight']}")
+        
         print(f"Loaded parameters from {params_file}")
     
-    def run_comparison(self, wait_for_input=True):
-        """Run the comparison between optimal MPC and learned policy.
-        
-        Parameters
-        ----------
-        wait_for_input : bool
-            Whether to wait for user input before starting.
-        """
-        if self.initial_states is None:
-            raise ValueError("Generate test states first using generate_test_states()")
-        
-        if not hasattr(self, 'params_init_vec'):
-            self.load_learned_params()
-        
-        if wait_for_input:
-            input("Press Enter to start testing...")
+    def run_comparison(self):
+        """Run the comparison between optimal MPC and learned policy."""
         
         N_TEST = len(self.initial_states)
         print(f"Testing {N_TEST} initial states...")
@@ -376,8 +404,6 @@ class CartPoleMPCComparison:
             x_opt, u_opt = self.extract_traj(w_opt)
             x_opt = np.asarray(x_opt)
             u_opt = np.asarray(u_opt)
-            self.x_opt_batch.append(x_opt)
-            self.u_opt_batch.append(u_opt)
 
             # Simulate the learned policy for the same initial state
             x_sim = np.zeros((self.NX, self.N + 1))
@@ -396,6 +422,9 @@ class CartPoleMPCComparison:
                 print(f"    Initial state: {x0}")
                 continue
             
+            # Store results for valid test case
+            self.x_opt_batch.append(x_opt)
+            self.u_opt_batch.append(u_opt)
             self.x_sim_batch.append(x_sim)
             self.u_sim_batch.append(u_sim)
             self.valid_indices.append(i)
@@ -742,7 +771,7 @@ class CartPoleMPCComparison:
         
         # Compute errors
         U_error_learned = np.abs(U_opt_grid - U_learned_grid)
-        U_error_lqr = np.abs(U_opt_grid - U_lqr_grid)
+        U_error_lqr = np.abs(U_lqr_grid - U_learned_grid)
 
         fig = plt.figure(figsize=(16, 10))
         
@@ -792,7 +821,7 @@ class CartPoleMPCComparison:
         
         ax6 = fig.add_subplot(2, 3, 6)
         ax6.semilogy(grid, U_error_lqr.flatten(), alpha=0.7, color='C4', linewidth=2, label='LQR error')
-        ax6.set_title('|Optimal - LQR| (log scale)')
+        ax6.set_title('|LQR - Learned| (log scale)')
         ax6.set_xlabel('Angle (rad)')
         ax6.set_ylabel('|Error| (N)')
         ax6.grid(True, which='both')
@@ -889,16 +918,16 @@ class CartPoleMPCComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = CartPoleMPCComparison(
-        layer_sizes=[4, 40, 20],
+        layer_sizes=[4, 30, 30, 20],
         beta=20.0,
         horizon=20
     )
     
     # Generate test states
-    comparison.generate_test_states(n_test=200, seed=42)
+    comparison.generate_test_states(n_test=200, seed=36)
     
     # Run comparison
-    comparison.run_comparison(wait_for_input=True)
+    comparison.run_comparison()
     
     # Print results
     comparison.print_results(threshold_rmse=0.01)

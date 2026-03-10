@@ -93,8 +93,8 @@ class CartPoleMPCInputCollocation:
         self.omega_train_bound = self.omega_bound * alpha
         
         # Control bounds
-        self.u_min = -25.0
-        self.u_max = 25.0
+        self.u_min = -10.0
+        self.u_max = 10.0
         
         # Setup model directory
         if model_dir is None:
@@ -152,7 +152,7 @@ class CartPoleMPCInputCollocation:
         
         # Create a neural network function
         x = ca.SX.sym('x', self.NX)
-        self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [self.net(x.T)])
+        self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [self.net(x.T).T])
     
     def initialize_parameters(self, params_file=None):
         """Initialize network parameters.
@@ -171,6 +171,7 @@ class CartPoleMPCInputCollocation:
             try:
                 params_init = self.load_params(params_file, self.n_param)
                 print(f"Loaded pre-optimized parameters from {params_file}")
+                input("Press Enter to continue with these parameters, or Ctrl+C to abort ")
                 return params_init
             except (FileNotFoundError, ValueError) as e:
                 print(f"Could not load parameters from {params_file}: {e}")
@@ -430,24 +431,19 @@ class CartPoleMPCInputCollocation:
             # lbw += [-50.0] * self.n_param
             # ubw += [50.0] * self.n_param
             # w0 += params_init.tolist()
-            
+            control_vec = []
             for k in range(self.N):
                 # Control input
                 u_k = ca.SX.sym('U_' + str(i) + '_' + str(k), self.NU)
                 lbw += [self.u_min] * self.NU
                 ubw += [self.u_max] * self.NU
                 w += [u_k]
+                control_vec.append(u_k)
                 # Use control warm start if available
                 if control_warm_start is not None:
                     w0 += control_warm_start[(i, k)].tolist()
                 else:
                     w0 += [0.0] * self.NU
-                
-                # Add constraint on control input as function approximator
-                g += [u_k - self.net_fcn(x0, z)[k]]
-                # The constraint relaxes, allowing some deviation from the NN output to ease optimization
-                lbg += [0.0] * self.NU  # Allow small deviation
-                ubg += [0.0] * self.NU
                 
                 # State at collocation points
                 Xc = []
@@ -504,6 +500,12 @@ class CartPoleMPCInputCollocation:
                 g += [Xk_end - Xk]
                 lbg += [0.0] * self.NX
                 ubg += [0.0] * self.NX
+            
+            # Add constraint on control input as function approximator
+            u_i = ca.vertcat(*control_vec)
+            g += [u_i - self.net_fcn(x0, z)]
+            lbg += [0.0] * self.NU * self.N
+            ubg += [0.0] * self.NU * self.N
             
             # Add terminal cost
             J += (Xk - self.xr).T @ E_dm @ (Xk - self.xr)
@@ -682,22 +684,23 @@ class CartPoleMPCInputCollocation:
         date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         
         # Prepare data for serialization
+        # Convert CasADi DM matrices to native Python types for serialization
+        q_weights_list = np.asarray(self.Q.full()).flatten().tolist()
+        # R is a 1x1 diagonal matrix
+        r_weight_val = float(self.R.full().flatten()[0])
+
         params_dict = {
             "optimal_params": np.asarray(self.optimal_params).tolist(),
             "n_param": int(self.n_param),
             "layer_sizes": self.layer_sizes,
             "model_name": self.model_name,
             "batch_size": int(self.NB),
+            "q_weights": [float(w) for w in q_weights_list],
+            "r_weight": r_weight_val,
             "beta": float(self.beta),
             "horizon": int(self.N),
             "date": date_str
         }
-        
-        # Save JSON
-        json_path = self.model_dir / f"optimal_params_cp_{self.model_name}_{date_str}.json"
-        with json_path.open("w") as f:
-            json.dump(params_dict, f, indent=2)
-        print(f"Saved parameters to {json_path}")
         
         # Save YAML
         yaml_path = self.model_dir / f"optimal_params_cp_{self.model_name}_{date_str}.yaml"
@@ -829,7 +832,7 @@ class CartPoleMPCInputCollocation:
         return params_init_vec
     
     @staticmethod
-    def find_latest_params(model_dir, model_name, extension="yaml"):
+    def find_latest_params(model_dir, model_name, extension="yaml", q_weights=None, r_weight=None):
         """Find the most recent parameter file for a given model.
         
         Parameters
@@ -840,6 +843,10 @@ class CartPoleMPCInputCollocation:
             Model name (e.g., '4x6x6x1').
         extension : str
             File extension ('yaml' or 'json').
+        q_weights : list of float, optional
+            State cost weights to match. If None, matching is skipped.
+        r_weight : float, optional
+            Control cost weight to match. If None, matching is skipped.
         
         Returns
         -------
@@ -850,6 +857,42 @@ class CartPoleMPCInputCollocation:
         files = list(model_dir.glob(pattern))
         if not files:
             return None
+        
+        # Filter by Q and R weights if provided
+        if q_weights is not None or r_weight is not None:
+            matching_files = []
+            for file_path in files:
+                try:
+                    if extension == "yaml":
+                        with file_path.open("r") as f:
+                            data = yaml.safe_load(f)
+                    else:  # json
+                        with file_path.open("r") as f:
+                            data = json.load(f)
+                    
+                    # Check if weights match
+                    weights_match = True
+                    if q_weights is not None:
+                        file_q_weights = data.get("q_weights")
+                        if file_q_weights is None or not np.allclose(file_q_weights, q_weights):
+                            weights_match = False
+                    
+                    if r_weight is not None:
+                        file_r_weight = data.get("r_weight")
+                        if file_r_weight is None or not np.isclose(file_r_weight, r_weight):
+                            weights_match = False
+                    
+                    if weights_match:
+                        matching_files.append(file_path)
+                except Exception as e:
+                    print(f"Warning: Could not read {file_path}: {e}")
+                    continue
+            
+            files = matching_files
+        
+        if not files:
+            return None
+        
         latest_file = max(files, key=lambda f: f.stat().st_mtime)
         return latest_file
 
@@ -857,7 +900,7 @@ def main():
     """Main function demonstrating usage of the CartPoleMPCInputCollocation class."""
     # Configure the problem
     mpc = CartPoleMPCInputCollocation(
-        layer_sizes=[4, 30, 20],
+        layer_sizes=[4, 30, 30, 20],
         batch_size=40,
         horizon=20,
         degree=3,
@@ -869,12 +912,21 @@ def main():
     )
     
     mpc.generate_intial_states()
-    
     # Initialize params with warm start
     # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
     # warm_params = None
     
-    params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+    # Get q_weights and r_weight for filtering
+    q_weights_list = np.asarray(mpc.Q.full()).flatten().tolist()
+    r_weight_val = float(mpc.R.full().flatten()[0])
+    
+    params_file = mpc.find_latest_params(
+        mpc.model_dir, 
+        mpc.model_name, 
+        extension="yaml",
+        q_weights=q_weights_list,
+        r_weight=r_weight_val
+    )
     warm_params = mpc.initialize_parameters(params_file)
     
     # Setup and solve the optimization problem
