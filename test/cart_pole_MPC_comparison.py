@@ -134,7 +134,7 @@ class CartPoleMPCComparison:
         self.layer_sizes = layer_sizes
         self.beta = beta
         self.N = horizon
-        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn"
+        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn" / "cart_pole"
         
         # Initialize cart-pole model
         self.cart_pole = CartPole(sym_type='SX')
@@ -231,8 +231,8 @@ class CartPoleMPCComparison:
         # Define dynamics and stage cost
         x = ca.SX.sym('x', self.NX)
         u = ca.SX.sym('u', self.NU)
-        # self.Q = ca.diag(ca.DM([100, 1, 30, 1]))  # state cost weights
-        # self.R = ca.diag(ca.DM([1.0]))  # control cost weight
+        # self.Q_mat = ca.DM(self.Q).reshape(self.NX, self.NX)  # state cost weights
+        # self.R_mat = ca.DM([1.0]).reshape(self.NU, self.NU)  # control cost weight
         x_dot = self.cart_pole.dynamics(x, u)
         self.xr = ca.DM([0.0, 0.0, 0.0, 0.0])  # reference state (upright pole)
         self.ur = ca.DM([0.0])                  # reference control input
@@ -331,7 +331,7 @@ class CartPoleMPCComparison:
             Random seed for reproducibility.
         """
         np.random.seed(seed)
-        alpha = 0.2  # scaling factor to ensure test states are within training distribution
+        alpha = 0.5  # scaling factor to ensure test states are within training distribution
         self.p_test_bound = self.p_bound * alpha
         self.v_test_bound = self.v_bound * alpha
         self.theta_test_bound = self.theta_bound * alpha
@@ -349,6 +349,7 @@ class CartPoleMPCComparison:
         """Load parameters for the learned policy."""
         model_name = get_model_name(self.layer_sizes)
         params_file = find_latest_params(self.model_dir, model_name, "yaml")
+        params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/cart_pole/optimal_params_cp_4x30x30x20_2026-03-10_13-50-47.yaml"
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         
@@ -358,11 +359,12 @@ class CartPoleMPCComparison:
         
         # Load Q and R weights from file
         if param_data['q_weights'] is not None:
-            self.Q = ca.diag(ca.DM(param_data['q_weights']))
+            print(ca.DM(param_data['q_weights']).shape)
+            self.Q = ca.DM(param_data['q_weights']).reshape((self.NX, self.NX))
             print(f"Loaded Q weights from file: {param_data['q_weights']}")
         
         if param_data['r_weight'] is not None:
-            self.R = ca.diag(ca.DM([param_data['r_weight']]))
+            self.R = ca.DM([param_data['r_weight']]).reshape((self.NU, self.NU))
             print(f"Loaded R weight from file: {param_data['r_weight']}")
         
         print(f"Loaded parameters from {params_file}")
@@ -452,6 +454,54 @@ class CartPoleMPCComparison:
         if N_INVALID > 0:
             print(f"\n{N_INVALID} test case(s) were skipped due to NaN values.")
         print(f"Analyzing {N_VALID} valid test cases...\n")
+        
+    def close_loop_simulation(self, x0, Nsim=100):
+        """Test the learned policy in closed-loop simulation from a given initial state."""
+        x_sim = np.zeros((self.NX, Nsim + 1))
+        u_sim = np.zeros((self.NU, Nsim))
+        x_sim[:, 0] = x0
+        for k in range(Nsim):
+            u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
+            u_sim[:, k] = u_next
+            x_next, _ = self.f_dyn(x_sim[:, k], u_sim[:, k])
+            x_sim[:, k + 1] = x_next.full().flatten()
+        
+        # Check for NaN values in the simulation
+        has_nan = np.isnan(x_sim).any() or np.isnan(u_sim).any()
+        if has_nan:
+            print(f"Warning: Closed-loop simulation produced NaN values.")
+            print(f"Initial state: {x0}")
+            return None, None
+        
+        # Plot results
+        time = np.arange(Nsim + 1) * self.cart_pole.dt
+        time_u = np.arange(Nsim) * self.cart_pole.dt
+        fig, axes = plt.subplots(5, 1, figsize=(10, 10))
+        title = "Closed-Loop Simulation with Learned Policy"
+        axes[0].plot(time, x_sim[0, :], label='Position')
+        axes[0].set_ylabel('Position')
+        axes[0].grid(True)
+        axes[0].legend()
+        axes[1].plot(time, x_sim[1, :], label='Velocity') 
+        axes[1].set_ylabel('Velocity')
+        axes[1].grid(True)
+        axes[1].legend()
+        axes[2].plot(time, x_sim[2, :], label='Angle')
+        axes[2].set_ylabel('Angle')
+        axes[2].grid(True)
+        axes[2].legend()
+        axes[3].plot(time, x_sim[3, :], label='Angular Velocity')
+        axes[3].set_ylabel('Angular Velocity')
+        axes[3].grid(True)
+        axes[3].legend()
+        axes[4].plot(time_u, u_sim[0, :], label='Control Input')
+        axes[4].set_ylabel('Control Input')
+        axes[4].set_xlabel('Time (s)')
+        axes[4].grid(True)
+        axes[4].legend()
+        plt.suptitle(title)
+        plt.tight_layout()
+        # plt.show()
     
     def _compute_trajectory_cost(self, x_traj, u_traj):
         """Compute the total cost for a trajectory.
@@ -927,15 +977,21 @@ if __name__ == "__main__":
     comparison.generate_test_states(n_test=200, seed=36)
     
     # Run comparison
-    comparison.run_comparison()
+    # comparison.run_comparison()
     
     # Print results
-    comparison.print_results(threshold_rmse=0.01)
+    # comparison.print_results(threshold_rmse=0.01)
+    
+    # Test closed-loop simulation from a specific initial state
+    # Extract an initial state from the test cases
+    x0_test = comparison.initial_states[np.random.choice(comparison.initial_states.shape[0]), :].tolist()
+    comparison.close_loop_simulation(x0_test, Nsim=100)
+
     
     # Generate plots
-    comparison.plot_trajectories()
+    # comparison.plot_trajectories()
     comparison.plot_policy()
     # comparison.plot_policy_3d()
-    comparison.plot_errors()
+    # comparison.plot_errors()
     # comparison.plot_costs()
     comparison.show_plots()
