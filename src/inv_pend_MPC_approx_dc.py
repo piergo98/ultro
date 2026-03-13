@@ -93,7 +93,7 @@ class InvertedPendulumMPCInputCollocation:
         
         # Setup model directory
         if model_dir is None:
-            self.model_dir = Path(__file__).parent.parent / "models_nn"
+            self.model_dir = Path(__file__).parent.parent / "models_nn" / "inverted_pendulum"
         else:
             self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -626,12 +626,6 @@ class InvertedPendulumMPCInputCollocation:
             "date": date_str
         }
         
-        # Save JSON
-        json_path = self.model_dir / f"optimal_params_ip_{self.model_name}_{date_str}.json"
-        with json_path.open("w") as f:
-            json.dump(params_dict, f, indent=2)
-        print(f"Saved parameters to {json_path}")
-        
         # Save YAML
         yaml_path = self.model_dir / f"optimal_params_ip_{self.model_name}_{date_str}.yaml"
         with yaml_path.open("w") as f:
@@ -789,7 +783,7 @@ class InvertedPendulumMPCInputCollocation:
 def main():
     # Configure the problem
     mpc = InvertedPendulumMPCInputCollocation(
-        layer_sizes=[2, 40, 10],
+        layer_sizes=[2, 20, 20, 10],
         batch_size=40,
         horizon=10,
         degree=3,
@@ -809,7 +803,7 @@ def main():
     warm_params = mpc.initialize_parameters(params_file)
 
     # Setup and solve the optimization problem
-    mpc.setup_optimization(warm_params, use_state_warm_start=True)
+    mpc.setup_optimization(warm_params, use_state_warm_start=False)
     mpc.solve()
     
     # Visualize results

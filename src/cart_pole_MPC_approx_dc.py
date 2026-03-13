@@ -86,7 +86,7 @@ class CartPoleMPCInputCollocation:
         self.omega_bound = 2.0
         
         # Training bounds
-        alpha = 0.3
+        alpha = 0.5
         self.p_train_bound = self.p_bound * alpha
         self.v_train_bound = self.v_bound * alpha
         self.theta_train_bound = self.theta_bound * alpha
@@ -98,7 +98,7 @@ class CartPoleMPCInputCollocation:
         
         # Setup model directory
         if model_dir is None:
-            self.model_dir = Path(__file__).parent.parent / "models_nn"
+            self.model_dir = Path(__file__).parent.parent / "models_nn" / "cart_pole"
         else:
             self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -226,10 +226,10 @@ class CartPoleMPCInputCollocation:
         # Rollout the MPC 
         U_target = []
         for i in range(num_samples):
-            u_opt = self.cart_pole.solve_MPC(X_train[:, i])
+            u_opt = self.cart_pole.solve_MPC(X_train[:, i], ret_seq=True)
             U_target.append(u_opt)
         
-        U_target = np.array(U_target).reshape(self.NU, num_samples)
+        U_target = np.array(U_target).reshape(self.NU * self.N, num_samples)
         
         # Forward pass
         F = self.net_fcn.map(num_samples)
@@ -904,30 +904,32 @@ def main():
         batch_size=40,
         horizon=20,
         degree=3,
-        beta=50.0,
-        q_weights=[100.0, 1.0, 30.0, 1.0],
-        r_weight=1.0,
+        beta=20.0,
+        q_weights=[0.25, 0.025, 0.25, 0.025],
+        r_weight=0.01,
         regularization=1e-4,
         seed=42
     )
     
     mpc.generate_intial_states()
+    
     # Initialize params with warm start
-    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
+    warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
     # warm_params = None
     
     # Get q_weights and r_weight for filtering
     q_weights_list = np.asarray(mpc.Q.full()).flatten().tolist()
     r_weight_val = float(mpc.R.full().flatten()[0])
     
-    params_file = mpc.find_latest_params(
-        mpc.model_dir, 
-        mpc.model_name, 
-        extension="yaml",
-        q_weights=q_weights_list,
-        r_weight=r_weight_val
-    )
-    warm_params = mpc.initialize_parameters(params_file)
+    # params_file = mpc.find_latest_params(
+    #     mpc.model_dir, 
+    #     mpc.model_name, 
+    #     extension="yaml",
+    #     q_weights=q_weights_list,
+    #     r_weight=r_weight_val
+    # )
+    params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/optimal_params_cp_4x30x30x20_2026-03-10_13-50-47.yaml"
+    # warm_params = mpc.initialize_parameters(params_file)
     
     # Setup and solve the optimization problem
     mpc.setup_optimization(warm_params, warm_start='mpc')
