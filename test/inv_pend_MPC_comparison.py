@@ -373,8 +373,6 @@ class InvertedPendulumMPCComparison:
             x_opt, u_opt = self.extract_traj(w_opt)
             x_opt = np.asarray(x_opt)
             u_opt = np.asarray(u_opt)
-            self.x_opt_batch.append(x_opt)
-            self.u_opt_batch.append(u_opt)
 
             # Simulate the learned policy for the same initial state
             x_sim = np.zeros((self.NX, self.N + 1))
@@ -393,6 +391,9 @@ class InvertedPendulumMPCComparison:
                 print(f"    Initial state: {x0}")
                 continue
             
+            # Store results for valid test case
+            self.x_opt_batch.append(x_opt)
+            self.u_opt_batch.append(u_opt)
             self.x_sim_batch.append(x_sim)
             self.u_sim_batch.append(u_sim)
             self.valid_indices.append(i)
@@ -816,13 +817,13 @@ class InvertedPendulumMPCComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = InvertedPendulumMPCComparison(
-        layer_sizes=[2, 20, 10],
-        beta=30.0,
+        layer_sizes=[2, 20, 20, 10],
+        beta=50.0,
         horizon=10
     )
     
     # Generate test states
-    comparison.generate_test_states(n_test=200, seed=42)
+    comparison.generate_test_states(n_test=200, seed=36)
     
     # Run comparison
     comparison.run_comparison(wait_for_input=True)
