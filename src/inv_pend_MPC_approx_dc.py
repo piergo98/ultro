@@ -11,6 +11,7 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 
 from csnn import set_sym_type, Linear, Sequential, ReLU, Softplus
+from models.neural_complementarity_network import ComplementarityReLUNetwork
 from models.inverted_pendulum import InvertedPendulum
 
 
@@ -33,6 +34,7 @@ class InvertedPendulumMPCInputCollocation:
         r_weight=0.01,
         regularization=1e-4,
         seed=42,
+        complementarity_constraints=True,
         model_dir=None,
     ):
         """Initialize the MPC approximation problem.
@@ -70,6 +72,7 @@ class InvertedPendulumMPCInputCollocation:
         self.beta = beta
         self.regularization = regularization
         self.seed = seed
+        self.complementarity_constraints = complementarity_constraints
         
         # Cost weights
         self.Q = ca.diag(ca.DM(q_weights))
@@ -118,7 +121,15 @@ class InvertedPendulumMPCInputCollocation:
         self.ubg = None
         
         # Setup network
-        self.setup_network()
+        if self.complementarity_constraints:
+            print("Setting up complementarity network with ReLU activations...")
+            self.setup_complementarity_network()
+        else:
+            print("Setting up standard feedforward network with Softplus activations...")
+            self.setup_network()
+        
+        # Setup complementarity network
+        
         
     def get_model_name(self):
         """Generate model name from layer sizes."""
@@ -148,6 +159,34 @@ class InvertedPendulumMPCInputCollocation:
         # Create a neural network function
         x = ca.SX.sym('x', self.NX)
         self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [self.net(x.T)])
+        
+    def setup_complementarity_network(self):
+        """Set up a complementarity network with ReLU activations.
+        
+        Hidden layers are modeled with variables a >= 0 and s >= 0 such that
+        z = a - s and a_i * s_i = 0. The last layer is linear.
+        """
+        # Instantiate the complementarity network
+        comp_net = ComplementarityReLUNetwork(self.layer_sizes)
+        
+        # Build the symbolic network and get the output and constraints
+        x = ca.SX.sym('x', self.NX)
+        self.comp_net = comp_net.build(x)
+        self.n_param = comp_net.n_params
+        # Extract network output, the params, and the complementarity constraint
+        # for the optimization problem
+        self.params_flattened = self.comp_net["params_flat"]
+        self.net = self.comp_net["output"]
+        self.cc_vars = self.comp_net["vars"]
+        self.cc_vars_lbw = self.comp_net["lbw"]
+        self.cc_vars_ubw = self.comp_net["ubw"]
+        self.cc = self.comp_net["g"]
+        self.cc_lbg = self.comp_net["lbg"]
+        self.cc_ubg = self.comp_net["ubg"]
+        
+        # Create a neural network function for evaluation
+        self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened, *self.cc_vars], [self.net])
+        self.cc_fcn = ca.Function('cc_fcn', [x, self.params_flattened, *self.cc_vars], [ca.vertcat(*self.cc)])
     
     def initialize_parameters(self, params_file=None):
         """Initialize network parameters.
@@ -175,7 +214,7 @@ class InvertedPendulumMPCInputCollocation:
         print("Using Kaiming (He) initialization.")
         return self.parameter_initialization_he()
     
-    def generate_intial_states(self):
+    def generate_initial_states(self):
         """Generate initial states for training."""
         self.X_train = np.random.uniform(
             low=np.array([-self.theta_train_bound, -self.omega_train_bound]).reshape(-1, 1),
@@ -239,6 +278,17 @@ class InvertedPendulumMPCInputCollocation:
         
         print("Network warm start complete.")
         return params
+    
+    def solve_closed_loop_MPC_for_initial_states(self):
+        """Solve closed-loop MPC for each initial state to generate initial guess trajectories. """
+        self.initial_trajectories = np.zeros((self.NX, self.N + 1, self.NB))
+        self.initial_controls = np.zeros((self.NU, self.N, self.NB))
+        for i in range(self.NB):
+            # Simulate forward in time
+            x_traj, u_traj = self.inverted_pend.close_loop_simulation(self.X_train[:, i], Nsim=self.N, plot_results=False)
+            # Store trajectories
+            self.initial_trajectories[:, :, i] = x_traj.T
+            self.initial_controls[:, :, i] = u_traj.T
     
     def generate_state_warm_start(self, X0):
         """Generate state warm start by forward propagating with zero control.
@@ -322,15 +372,16 @@ class InvertedPendulumMPCInputCollocation:
         x_next = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         return x_next
     
-    def setup_optimization(self, params_init=None, use_state_warm_start=True):
+    def setup_optimization(self, params_init=None, warm_start='mpc'):
         """Set up the NLP optimization problem.
         
         Parameters
         ----------
         params_init : np.ndarray, optional
             Initial parameters. If None, will use He initialization.
-        use_state_warm_start : bool, optional
-            Whether to use state warm start by forward propagating with zero control.
+        warm_start : string, optional
+            Method for warm starting the optimization. Options are 'mpc' for using closed loop MPC trajectories, 
+            'col' for using collocation-based state warm start, or None for no warm start.
         """
         print("Setting up optimization for learning problem...")
         
@@ -340,9 +391,25 @@ class InvertedPendulumMPCInputCollocation:
         
         # Generate state warm start if requested
         state_warm_start = None
-        if use_state_warm_start:
+        control_warm_start = None
+        if warm_start == 'col':
             state_warm_start = self.generate_state_warm_start(self.X_train)
-        
+        elif warm_start == 'mpc':
+            # Generate initial trajectories by solving closed-loop MPC for each initial state
+            # Warm starts both state and control actions
+            self.solve_closed_loop_MPC_for_initial_states()
+            state_warm_start = {}
+            control_warm_start = {}
+            for i in range(self.NB):
+                for k in range(self.N + 1):
+                    state_warm_start[(i, k)] = self.initial_trajectories[:, k, i]
+                for k in range(self.N):
+                    state_warm_start[(i, k, 0)] = self.initial_trajectories[:, k, i]  # colloc point 0
+                    state_warm_start[(i, k, 1)] = (self.initial_trajectories[:, k, i] + self.initial_trajectories[:, k + 1, i]) / 2  # colloc point 1
+                    state_warm_start[(i, k, 2)] = self.initial_trajectories[:, k + 1, i]  # colloc point 2
+                    # Store control warm start
+                    control_warm_start[(i, k)] = self.initial_controls[:, k, i]
+                    
         # Get collocation coefficients
         C_coeff, D_coeff, B_coeff, tau_root = self.get_collocation_coefficients()
         
@@ -400,12 +467,32 @@ class InvertedPendulumMPCInputCollocation:
                 lbw += [self.u_min] * self.NU
                 ubw += [self.u_max] * self.NU
                 w += [u_k]
-                w0 += [0.0] * self.NU
+                # Use control warm start if available
+                if control_warm_start is not None:
+                    w0 += control_warm_start[(i, k)].tolist()
+                else:
+                    w0 += [0.0] * self.NU
+
+                # Complementarity variables for this step
+                cc_step_vars = []
+                for layer_idx, cc_var in enumerate(self.cc_vars):
+                    nrow, ncol = cc_var.shape
+                    y_var = ca.SX.sym(f"Y_{i}_{k}_{layer_idx}", nrow, ncol)
+                    cc_step_vars.append(y_var)
+                    w += [y_var]
+                    lbw += [0.0] * (nrow * ncol)
+                    ubw += [ca.inf] * (nrow * ncol)
+                    w0 += [0.0] * (nrow * ncol)
                 
                 # Add constraint on control input as function approximator
-                g += [u_k - self.net_fcn(x0, z)[k]]
+                g += [u_k - self.net_fcn(x0, z, *cc_step_vars)[k]]
                 lbg += [0.0] * self.NU
                 ubg += [0.0] * self.NU
+
+                # Add complementarity constraints for this step
+                g += [self.cc_fcn(Xk, z, *cc_step_vars)]
+                lbg += self.cc_lbg
+                ubg += self.cc_ubg
                 
                 # State at collocation points
                 Xc = []
@@ -627,7 +714,10 @@ class InvertedPendulumMPCInputCollocation:
         }
         
         # Save YAML
-        yaml_path = self.model_dir / f"optimal_params_ip_{self.model_name}_{date_str}.yaml"
+        if self.complementarity_constraints:
+            yaml_path = self.model_dir / f"optimal_params_ip_cc_{self.model_name}_{date_str}.yaml"
+        else:
+            yaml_path = self.model_dir / f"optimal_params_ip_{self.model_name}_{date_str}.yaml"
         with yaml_path.open("w") as f:
             yaml.safe_dump(params_dict, f)
         print(f"Saved parameters to {yaml_path}")
@@ -755,8 +845,7 @@ class InvertedPendulumMPCInputCollocation:
         
         return params_init_vec
     
-    @staticmethod
-    def find_latest_params(model_dir, model_name, extension="yaml"):
+    def find_latest_params(self, model_dir, model_name, extension="yaml"):
         """Find the most recent parameter file for a given model.
         
         Parameters
@@ -773,7 +862,10 @@ class InvertedPendulumMPCInputCollocation:
         latest_file : Path or None
             Path to the most recent parameter file, or None if not found.
         """
-        pattern = f"optimal_params_ip_{model_name}_*.{extension}"
+        if self.complementarity_constraints:
+            pattern = f"optimal_params_ip_cc_{model_name}_*.{extension}"
+        else:
+            pattern = f"optimal_params_ip_{model_name}_*.{extension}"
         files = list(model_dir.glob(pattern))
         if not files:
             return None
@@ -791,19 +883,21 @@ def main():
         q_weights=[30, 1],
         r_weight=1.0,
         regularization=1e-4,
-        seed=42
+        seed=42,
+        complementarity_constraints=True,
     )
     
-    mpc.generate_intial_states()
+    mpc.generate_initial_states()
     
     # Initialize params with warm start
     # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
+    warm_params = None
     
-    params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
-    warm_params = mpc.initialize_parameters(params_file)
+    # params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+    # warm_params = mpc.initialize_parameters(params_file)
 
     # Setup and solve the optimization problem
-    mpc.setup_optimization(warm_params, use_state_warm_start=False)
+    mpc.setup_optimization(warm_params, warm_start='mpc')
     mpc.solve()
     
     # Visualize results
