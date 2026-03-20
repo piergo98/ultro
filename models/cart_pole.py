@@ -96,7 +96,7 @@ class CartPole:
         
         # Define cost function (quadratic cost on state deviation and control effort)
         xr = ca.DM([0.0, 0, 0, 0])  # desired state (upright position)
-        Q = ca.diag(ca.DM([100, 1, 30, 1]))  # state cost weights
+        Q = ca.diag(ca.DM([0.25, 0.025, 0.25, 0.025]))  # state cost weights
         R = ca.diag(ca.DM([0.01]))  # control cost weight
         A, B = self.lin_dyn(xr, ca.DM([0]))  # linearized dynamics around the upright position
         E = solve_continuous_are(A.full(), B.full(), Q.full(), R.full())
@@ -132,8 +132,8 @@ class CartPole:
         for k in range(N):
             uk = ca.SX.sym('u_' + str(k), 1)
             w += [uk]
-            self.lbw += [-25.0]  # control limits
-            self.ubw += [25.0]
+            self.lbw += [-10.0]  # control limits
+            self.ubw += [10.0]
             self.w0 += [0.0]     # initial guess
             
             Xk_next, l_k = F(Xk, uk)
@@ -155,7 +155,7 @@ class CartPole:
         opts = {"ipopt.print_level": 0, "print_time": False, "verbose": False}
         self.solver = ca.nlpsol("solver", "ipopt", nlp_prob, opts)
     
-    def solve_MPC(self, x0):
+    def solve_MPC(self, x0, ret_seq=False):
         ''' Solve the MPC problem for a given initial state x0. '''
         # print(f"self.w0 = {self.w0}")
         # print(f"self.lbw = {self.lbw}")
@@ -174,9 +174,12 @@ class CartPole:
         
         x_opt, u_opt = self.extract_traj(sol['x'])
         # Return the optimal control sequence
+        if ret_seq:
+            return u_opt.full().flatten()  # return the full control sequence as a 1D array
+        
         return u_opt.full().flatten()[0]  # return only the first control input
         
-    def close_loop_simulation(self, x0, control_policy=None, plot_results=True):
+    def close_loop_simulation(self, x0, Nsim = 60, control_policy=None, plot_results=True):
         """Simulate the cart-pole system and plot the results.
         
         Parameters
@@ -186,26 +189,26 @@ class CartPole:
         control_policy : callable or array_like
             Either a function that takes state and returns control u = policy(x),
             or an array of control inputs for each time step. If None, the MPC controller will be used.
-        N : int
-            Number of simulation steps.
+        Nsim : int, optional
+            Number of simulation steps (default: 60).
         plot_results : bool, optional
             Whether to plot the results (default: True).
         
         Returns
         -------
         x_traj : np.ndarray
-            State trajectory of shape (N+1, 4).
+            State trajectory of shape (Nsim+1, 4).
         u_traj : np.ndarray
-            Control trajectory of shape (N,).
+            Control trajectory of shape (Nsim,).
         """
         # Initialize trajectories
-        x_traj = np.zeros((self.N + 1, 4))
-        u_traj = np.zeros(self.N)
+        x_traj = np.zeros((Nsim + 1, 4))
+        u_traj = np.zeros(Nsim)
         
         x_traj[0] = np.array(x0).flatten()
         
         # Simulate forward in time
-        for k in range(self.N):
+        for k in range(Nsim):
             # Get control input
             if control_policy is None:
                 u_k = self.solve_MPC(x_traj[k])  # Solve MPC to get control input for current state
@@ -230,8 +233,8 @@ class CartPole:
             return x_traj, u_traj
         
         # Plot results
-        time = np.arange(self.N + 1) * self.dt
-        time_u = np.arange(self.N) * self.dt
+        time = np.arange(Nsim + 1) * self.dt
+        time_u = np.arange(Nsim) * self.dt
         
         fig, axes = plt.subplots(5, 1, figsize=(10, 10))
         title = "Cart-Pole Simulation"
@@ -419,4 +422,4 @@ if __name__ == "__main__":
         x0, control_policy=None, 
         interval=50,  # 50ms between frames
         # save_path='cart_pole.gif'  # Optional: save to file
-)
+    )

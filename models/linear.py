@@ -66,7 +66,7 @@ class LinearSystem:
         F = ca.Function('F', [x, u], [x_next, l])
         
         x_bounds = [1, 1.5, 0.35, 1.0]
-        u_bounds = [10.0]
+        u_bounds = [1.0]
         
         # State and control bounds
         self.u_min, self.u_max = -np.array(u_bounds), np.array(u_bounds)
