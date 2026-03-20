@@ -14,7 +14,7 @@ from csnn import set_sym_type, Linear, Sequential, ReLU, Softplus
 from models.linear import LinearSystem
 
 
-class LinearMPCSequenceApproximation:
+class LinearMPCApproximation:
     """MPC approximation with sequence output for linear discrete-time systems.
     
     This class sets up and solves an optimization problem to learn a neural network
@@ -28,7 +28,7 @@ class LinearMPCSequenceApproximation:
         B,
         layer_sizes=None,
         batch_size=100,
-        beta=5.0,
+        beta=1.0,
         horizon=15,
         Q=None,
         R=None,
@@ -56,7 +56,7 @@ class LinearMPCSequenceApproximation:
         batch_size : int
             Number of parallel trajectories to optimize.
         beta : float
-            Scaling factor for activation function (e.g., Softplus).
+            Softplus activation parameter (beta > 0). Higher beta makes it closer to ReLU.
         horizon : int
             MPC horizon length.
         Q : np.ndarray or None
@@ -472,7 +472,6 @@ class LinearMPCSequenceApproximation:
                 self.w0 += x0
         
             # Iterate over horizon
-            control_vec = []
             for k in range(self.N):
                 # Extract k-th control from sequence
                 u_k = ca.SX.sym('u_' + str(i) + '_' + str(k), self.NU)
@@ -483,7 +482,11 @@ class LinearMPCSequenceApproximation:
                     self.w0 += control_warm_start[i][:, k].tolist()
                 else:
                     self.w0 += [0.0] * self.NU  # Initial guess for control
-                control_vec.append(u_k)
+                
+                # Add constraint on control input as function approximator
+                self.g += [u_k - self.net_fcn(x0, z)]
+                self.lbg += [0.0] * self.NU
+                self.ubg += [0.0] * self.NU
                 
                 # Compute next state
                 Xk_next, l_k = self.f_dyn(Xk, u_k)
@@ -505,12 +508,6 @@ class LinearMPCSequenceApproximation:
                          
                 # Accumulate cost
                 self.J += l_k
-                
-            # Add constraint on control input as function approximator
-            u_i = ca.vertcat(*control_vec)
-            self.g += [u_i - self.net_fcn(x0, z)]
-            self.lbg += [0.0] * self.NU * self.N
-            self.ubg += [0.0] * self.NU * self.N
             
             # Add terminal cost
             self.J += (Xk - self.xr).T @ self.E @ (Xk - self.xr)
@@ -828,11 +825,11 @@ def main():
     
     B = [[0.0], [0.1818], [0.0], [0.4546]]   
     # Configure the problem
-    mpc = LinearMPCSequenceApproximation(
+    mpc = LinearMPCApproximation(
         A=A,
         B=B,
-        layer_sizes=[4, 20, 20, 10],
-        batch_size=100,
+        layer_sizes=[4, 6, 6, 1],
+        batch_size=50,
         beta=5.0,
         horizon=10,
         Q=[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
@@ -841,29 +838,29 @@ def main():
         state_bounds=[1, 1.5, 0.35, 1.0],
         alpha_train=0.3,
         regularization=1e-4,
-        seed=42
+        seed=42,
     )
     # Generate random initial states for batch
     print(f"Generating {mpc.NB} random initial states...")
     mpc.generate_initial_states()
-    
+
     # Initialize params with warm start
     # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
-    # warm_params = None
+    warm_params = None
     
     # Load parameters from file
-    params_file = mpc.find_latest_params()
-    warm_params = mpc.initialize_parameters(params_file)
+    # params_file = mpc.find_latest_params()
+    # warm_params = mpc.initialize_parameters(params_file)
     
     # Setup and solve the optimization problem
-    # mpc.setup_optimization(warm_params, warm_start='mpc')
-    # mpc.solve()
+    mpc.setup_optimization(warm_params, warm_start='mpc')
+    mpc.solve()
     
-    # # Visualize results
-    # mpc.plot_results()
+    # Visualize results
+    mpc.plot_results()
     
-    # # Save optimal parameters
-    # mpc.save_results()
+    # Save optimal parameters
+    mpc.save_results()
     
     # Test the trained policy in closed loop
     print("\nTesting trained policy in closed loop...")
