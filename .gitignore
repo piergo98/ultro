@@ -34,3 +34,6 @@ Thumbs.db
 cli.py
 install.sh
 QUICKSTART.md
+
+# Work-in-progress files
+src/mpc_approx_dc.py
