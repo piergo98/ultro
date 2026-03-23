@@ -18,7 +18,7 @@ class InvertedPendulum:
         self.step = self.step_func()  # CasADi function for RK4 integration
         self.lin_dyn = self.linearized_dynamics()  # CasADi function for linearized dynamics
         
-        N = 20  # MPC horizon
+        N = 10  # MPC horizon
         self.define_simple_MPC_control(N)  # Define the MPC controller
 
     def dynamics_func(self):
@@ -149,7 +149,7 @@ class InvertedPendulum:
         opts = {"ipopt.print_level": 0, "print_time": False}
         self.solver = ca.nlpsol("solver", "ipopt", nlp_prob, opts)
     
-    def solve_MPC(self, x0):
+    def solve_MPC(self, x0, ret_seq=False):
         ''' Solve the MPC problem for a given initial state x0. '''
         # print(f"self.w0 = {self.w0}")
         # print(f"self.lbw = {self.lbw}")
@@ -168,6 +168,9 @@ class InvertedPendulum:
         
         x_opt, u_opt = self.extract_traj(sol['x'])
         # Return the optimal control sequence
+        if ret_seq:
+            return u_opt.full().flatten()  # return the full control sequence as a 1D array
+        
         return u_opt.full().flatten()[0]  # return only the first control input
         
     def close_loop_simulation(self, x0, Nsim = 60, control_policy=None, plot_results=True):
