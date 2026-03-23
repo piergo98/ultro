@@ -1,7 +1,7 @@
 import casadi as ca
 
 
-class ComplementarityReLUNetwork:
+class ComplementarityReLU_MLP:
 	"""ReLU network expressed with complementarity constraints.
 
 	Hidden layers enforce: y >= 0, y >= z, and y * (y - z) <= 0.
@@ -59,7 +59,7 @@ class ComplementarityReLUNetwork:
 		params_flat = ca.vertcat(*flat_parts) if flat_parts else self._sym(f"{self.name}_params", 0, 1)
 		return params, params_flat
 
-	def build(self, x, params=None):
+	def build(self, x, params=None, tau=1.0):
 		"""Build network output and complementarity constraints.
 
 		Parameters
@@ -69,6 +69,8 @@ class ComplementarityReLUNetwork:
 		params : list of tuple, optional
 			(W, b) pairs per layer. If None, they are created symbolically. When
 			use_bias is False, b should be None.
+		tau : float, optional
+			Relaxation parameter for complementarity constraints. Default is 1.0 (no relaxation).
 
 		Returns
 		-------
@@ -105,15 +107,15 @@ class ComplementarityReLUNetwork:
 			lbw.extend([0.0] * n_out)
 			ubw.extend([ca.inf] * n_out)
 
-			# y >= z
+			# y - z >= 0 (elementwise)
 			g.append(y_layer - z)
 			lbg.extend([0.0] * n_out)
 			ubg.extend([ca.inf] * n_out)
 
-			# y * (y - z) <= 0 (elementwise)
+			# y * (y - z) <= tau (elementwise)
 			g.append(y_layer * (y_layer - z))
 			lbg.extend([-ca.inf] * n_out)
-			ubg.extend([0.0] * n_out)
+			ubg.extend([tau] * n_out)
 
 			a = y_layer
 
@@ -148,7 +150,7 @@ class ComplementarityReLUNetwork:
 
 def main():
 	# Example usage and testing of the ComplementarityReLUNetwork
-	net = ComplementarityReLUNetwork([2, 6, 6, 2])
+	net = ComplementarityReLU_MLP([2, 6, 6, 2])
 	x = ca.SX.sym("x", 2)
 	result = net.build(x)
 	# print("Output expression:", result["output"])
