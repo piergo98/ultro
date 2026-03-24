@@ -138,7 +138,7 @@ class DiscontinuousControl:
         opts = {"ipopt.print_level": 0, "print_time": False, }
         self.solver = ca.nlpsol("solver", "ipopt", nlp_prob, opts)
     
-    def solve_MPC(self, x0, ret_seq=False):
+    def solve_MPC(self, x0, ret_seq=False, prev_sol=False):
         ''' Solve the MPC problem for a given initial state x0. '''
         sol = self.solver(
             x0=self.w0, 
@@ -150,6 +150,8 @@ class DiscontinuousControl:
         )
         
         x_opt, u_opt = self.extract_traj(sol['x'])
+        if prev_sol:
+            self.w0 = sol['x'].full().flatten().tolist()  # warm start for next iteration
         # Return the optimal control sequence
         if ret_seq:
             return u_opt.full().flatten()  # return the full control sequence as a 1D array
@@ -249,7 +251,7 @@ class DiscontinuousControl:
         
         for i in range(N):
             x0 = [x1_vals[i], x2_vals[i]]
-            U[i] = self.solve_MPC(x0)
+            U[i] = self.solve_MPC(x0, prev_sol=True)
         
         # Plot the control input as a function of theta
         plt.figure(figsize=(8, 6))

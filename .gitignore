@@ -38,3 +38,4 @@ QUICKSTART.md
 # Work-in-progress files
 src/mpc_approx_dc.py
 src/functional.py
+src/recurrent.py

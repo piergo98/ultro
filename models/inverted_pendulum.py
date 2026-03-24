@@ -103,8 +103,8 @@ class InvertedPendulum:
         
         p_bound = 2.0
         v_bound = 4.0
-        theta_bound = np.pi/3
-        omega_bound = 2.0
+        self.theta_bound = np.pi/3
+        self.omega_bound = 2.0
         
         # Create an NLP to minimize the cost over a horizon
         w = []      # decision variables
@@ -117,8 +117,8 @@ class InvertedPendulum:
         self.ubg = []    # upper bounds on constraints
         Xk = ca.SX.sym('X0', 2)  # initial state variable
         w += [Xk]
-        self.lbw += [-theta_bound, -omega_bound]
-        self.ubw += [theta_bound, omega_bound]
+        self.lbw += [-self.theta_bound, -self.omega_bound]
+        self.ubw += [self.theta_bound, self.omega_bound]
         self.w0 += [0.0 for _ in range(2)]
         g += [Xk - x0]  # initial state constraint
         self.lbg += [0.0 for _ in range(2)]
@@ -126,7 +126,7 @@ class InvertedPendulum:
         for k in range(N):
             uk = ca.SX.sym('u_' + str(k), 1)
             w += [uk]
-            self.lbw += [0.0]  # control limits
+            self.lbw += [-10.0]  # control limits
             self.ubw += [10.0]
             self.w0 += [0.0]     # initial guess
             
@@ -134,8 +134,8 @@ class InvertedPendulum:
             
             Xk = ca.SX.sym('X_' + str(k+1), 2)
             w += [Xk]
-            self.lbw += [-theta_bound, -omega_bound]
-            self.ubw += [theta_bound, omega_bound]
+            self.lbw += [-self.theta_bound, -self.omega_bound]
+            self.ubw += [self.theta_bound, self.omega_bound]
             self.w0 += [0.0 for _ in range(2)]
             
             g += [Xk_next - Xk]  # dynamics constraint

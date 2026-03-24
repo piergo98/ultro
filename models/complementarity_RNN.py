@@ -15,6 +15,7 @@ class ComplementarityRNN:
 		sym_type="SX",
 		name="rnn",
 		use_bias=True,
+		output_bias=True,
 		activation="relu",
 		complementarity=False,
 	):
@@ -34,6 +35,8 @@ class ComplementarityRNN:
 			Base name for symbolic variables, by default "rnn".
 		use_bias : bool, optional
 			Whether to include bias terms, by default True.
+		output_bias : bool, optional
+			Whether to include bias in the output layer, by default True.
 		activation : str, optional
 			Activation function, currently only "relu" is supported, by default "relu".
 		complementarity : bool, optional
@@ -43,10 +46,16 @@ class ComplementarityRNN:
     """
 		self.input_size = int(input_size)
 		self.hidden_size = int(hidden_size)
-		self.output_size = int(output_size)
+		if output_size > 0:
+			self.output_size = int(output_size)
+			self.output_layer = True
+		else:
+			self.output_layer = False
+			self.output_size = 0
 		self.sym_type = sym_type
 		self.name = name
 		self.use_bias = bool(use_bias)
+		self.output_bias = bool(output_bias)
 		self.activation = activation
 		self.complementarity = bool(complementarity)
 		self.n_params = self._count_parameters()
@@ -58,7 +67,7 @@ class ComplementarityRNN:
 		if self.use_bias:
 			count += self.hidden_size
 		count += self.output_size * self.hidden_size
-		if self.use_bias:
+		if self.output_bias:
 			count += self.output_size
 		return count
 
@@ -74,20 +83,28 @@ class ComplementarityRNN:
 		b_h = None
 		if self.use_bias:
 			b_h = self._sym(f"{self.name}_b_h", self.hidden_size, 1)
-		W_y = self._sym(f"{self.name}_W_y", self.output_size, self.hidden_size)
-		b_y = None
-		if self.use_bias:
-			b_y = self._sym(f"{self.name}_b_y", self.output_size, 1)
+		if self.output_layer:
+			W_y = self._sym(f"{self.name}_W_y", self.output_size, self.hidden_size)
+			b_y = None
+			if self.output_bias:
+				b_y = self._sym(f"{self.name}_b_y", self.output_size, 1)
 
 		flat_parts = [ca.reshape(W_x, -1, 1), ca.reshape(W_h, -1, 1)]
 		if b_h is not None:
 			flat_parts.append(ca.reshape(b_h, -1, 1))
-		flat_parts.append(ca.reshape(W_y, -1, 1))
-		if b_y is not None:
-			flat_parts.append(ca.reshape(b_y, -1, 1))
+		if self.output_layer:
+			flat_parts.append(ca.reshape(W_y, -1, 1))
+			if b_y is not None:
+				flat_parts.append(ca.reshape(b_y, -1, 1))
 
-		params = (W_x, W_h, b_h, W_y, b_y)
+				params = (W_x, W_h, b_h, W_y, b_y)
+			else:
+				params = (W_x, W_h, b_h, W_y)
+		else:
+			params = (W_x, W_h, b_h)
+		
 		params_flat = ca.vertcat(*flat_parts) if flat_parts else self._sym(f"{self.name}_params", 0, 1)
+   
 		return params, params_flat
 
 	def build(self, x_seq, h0=None, params=None, tau=1.0):
@@ -115,13 +132,20 @@ class ComplementarityRNN:
 			params, params_flat = self.create_parameters()
 		else:
 			params_flat = None
-		W_x, W_h, b_h, W_y, b_y = params
+		if self.output_layer and self.output_bias:
+			W_x, W_h, b_h, W_y, b_y = params
+		elif self.output_layer and not self.output_bias:
+			W_x, W_h, b_h, W_y = params
+			b_y = None
+		else:
+			W_x, W_h, b_h = params
+			W_y, b_y = None, None
 
 		if h0 is None:
 			h_prev = self._sym(f"{self.name}_h0", self.hidden_size, 1)
 		else:
 			h_prev = h0
-
+		# TODO: add support for multiple RNN layers
 		self.horizon = int(x_seq.shape[1])
 		vars_list = []
 		lbw = []
@@ -156,7 +180,7 @@ class ComplementarityRNN:
 
 			else:
 				h_t = ca.fmax(z_t, 0)
-	
+
 			y_t = W_y @ h_t
 			if b_y is not None:
 				y_t = y_t + b_y
