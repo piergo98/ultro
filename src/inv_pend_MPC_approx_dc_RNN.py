@@ -1,4 +1,5 @@
 from datetime import datetime
+import gc
 import json
 import os
 from pathlib import Path
@@ -124,6 +125,15 @@ class InvertedPendulumRNN:
         self.ubg = None
         
         # Setup network
+        if not self.hidden_sizes:
+            raise ValueError("hidden_sizes must contain at least one RNN layer size")
+
+        for size in self.hidden_sizes:
+            if size <= 0:
+                raise ValueError(f"Hidden layer sizes must be positive integers. Got {self.hidden_sizes}")
+        if len(self.hidden_sizes) > 1:
+            raise ValueError(f"Not yet implemented support for hidden layer sizes > 1. Got {self.hidden_sizes}")
+        
         if self.complementarity_constraints:
             print("Setting up complementarity RNN...")
             self.setup_complementarity_network()
@@ -141,13 +151,6 @@ class InvertedPendulumRNN:
     def setup_network(self):
         """Set up the RNN approximator."""
         set_sym_type("SX")
-
-        if not self.hidden_sizes:
-            raise ValueError("hidden_sizes must contain at least one RNN layer size")
-
-        for size in self.hidden_sizes:
-            if size <= 0:
-                raise ValueError(f"Hidden layer sizes must be positive integers. Got {self.hidden_sizes}")
 
         self.rnns = []
         params_flat_parts = []
@@ -193,6 +196,7 @@ class InvertedPendulumRNN:
         Hidden layers are modeled with variables a >= 0 and s >= 0 such that
         z = a - s and a_i * s_i = 0. The last layer is linear.
         """
+        
         self.rnns = []
         params_flat_parts = []
         cc_vars = []
@@ -216,6 +220,8 @@ class InvertedPendulumRNN:
                 hidden_size=size,
                 output_size=out_size,
                 complementarity=True,
+                use_bias=True,
+                output_bias=True,                
             )
             params_layer, params_flat = rnn.create_parameters()
             params_flat_parts.append(params_flat)
@@ -952,33 +958,49 @@ class InvertedPendulumRNN:
         return latest_file
 
 def main():
-    # Configure the problem
-    mpc = InvertedPendulumRNN(
-        hidden_sizes=[10],
-        batch_size=40,
-        horizon=10,
-        degree=3,
-        beta=60.0,
-        q_weights=[30, 1],
-        r_weight=1.0,
-        regularization=1e-4,
-        seed=42,
-        complementarity_constraints=True,
-        tau=1.0*1e-0,
-    )
+    tau_k = 1.0
+    tau_min = 1.0 * 1e-3
+    warm_params = None
+    while tau_k >= tau_min:
+        print(f"Testing with tau = {tau_k:.2e}")
+        # Configure the problem
+        mpc = InvertedPendulumRNN(
+            hidden_sizes=[10],
+            batch_size=40,
+            horizon=10,
+            degree=3,
+            beta=60.0,
+            q_weights=[30, 1],
+            r_weight=1.0,
+            regularization=1e-4,
+            seed=42,
+            complementarity_constraints=True,
+            tau=tau_k,
+        )
     
-    mpc.generate_initial_states()
+        mpc.generate_initial_states()
     
-    # Initialize params with warm start
-    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
-    # warm_params = None
-    
-    params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
-    warm_params = mpc.initialize_parameters(params_file)
+        # Initialize params with warm start
+        # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
+        # warm_params = None
+        
+        # params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+        # warm_params = mpc.initialize_parameters(params_file)
 
-    # Setup and solve the optimization problem
-    mpc.setup_optimization(warm_params, warm_start='mpc')
-    mpc.solve()
+        # Setup and solve the optimization problem
+        mpc.setup_optimization(warm_params, warm_start='mpc')
+        mpc.solve()
+        if mpc.solver.stats()['success']:
+            print("\nOptimization successful!")
+            # Extract solution for next iteration
+            warm_params = mpc.optimal_params.copy()
+            tau_k *= 0.1  # Increase beta for next iteration
+        else:
+            print("\nOptimization failed. Stopping training.")
+            break
+    
+        # Clean up solver resources for memory efficiency
+        gc.collect()
     
     # Visualize results
     mpc.plot_results()

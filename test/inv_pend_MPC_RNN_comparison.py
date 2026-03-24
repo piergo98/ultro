@@ -13,14 +13,15 @@ from scipy.linalg import solve_discrete_are, solve_continuous_are
 from csnn import set_sym_type, Linear, Sequential, ReLU, Softplus
 
 from models.inverted_pendulum import InvertedPendulum
+from models.complementarity_RNN import ComplementarityRNN
 
 
-def get_model_name(layer_sizes):
+def get_model_name(hidden_sizes):
     """Generate model name from layer sizes.
     
     Parameters
     ----------
-    layer_sizes : list of int
+    hidden_sizes : list of int
         List containing the sizes of each layer in the network.
     
     Returns
@@ -28,7 +29,7 @@ def get_model_name(layer_sizes):
     model_name : str
         Model name in format like '2x6x6x1'
     """
-    return 'x'.join(map(str, layer_sizes))
+    return 'x'.join(map(str, hidden_sizes))
 
 
 def load_params(params_file):
@@ -70,16 +71,16 @@ def load_params(params_file):
         
     return params_init_vec
 
-class InvertedPendulumMPCComparison:
+class InvertedPendulumMPC_RNNComparison:
     """Class for comparing optimal MPC with learned neural network policy for inverted pendulum system."""
     
-    def __init__(self, layer_sizes=[2, 20, 1], beta=0.5, horizon=20, complemetarity=False, model_dir=None):
+    def __init__(self, hidden_sizes=[10], beta=0.5, horizon=20, complemetarity=False, model_dir=None):
         """Initialize the MPC comparison.
         
         Parameters
         ----------
-        layer_sizes : list of int
-            Neural network architecture (including input and output layers).
+        hidden_sizes : list of int
+            List of hidden layer sizes for the RNN approximator.
         beta : float
             Softplus beta parameter.
         horizon : int
@@ -93,11 +94,11 @@ class InvertedPendulumMPCComparison:
         start_time = time.time()
         
         # Store parameters
-        self.layer_sizes = layer_sizes
+        self.hidden_sizes = hidden_sizes
         self.beta = beta
         self.N = horizon
         self.complementarity = complemetarity
-        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn" / "inverted_pendulum"
+        self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn" / "rnn_inverted_pendulum"
         
         # Initialize inverted pendulum model
         self.inverted_pendulum = InvertedPendulum(sym_type='SX')
@@ -127,30 +128,45 @@ class InvertedPendulumMPCComparison:
         """Set up the neural network approximator."""
         set_sym_type("SX")
         
-        # Build network from layer_sizes
-        layers = []
-        for i in range(len(self.layer_sizes) - 1):
-            layers.append(Linear(self.layer_sizes[i], self.layer_sizes[i + 1]))
-            if i < len(self.layer_sizes) - 2:  # add activation for all but last layer
-                if self.complementarity:
-                    layers.append(ReLU())
-                    # layers.append(Softplus(beta=self.beta))
-                else:
-                    layers.append(Softplus(beta=self.beta))
-                    
-        self.net = Sequential[ca.SX](tuple(layers))
-        
-        self.n_param = self.net.num_parameters
-        
-        # Get flattened network parameters
-        params = []
-        for _, param in self.net.parameters():
-            params.append(ca.reshape(param, -1, 1))
-        self.params_flattened = ca.vertcat(*params)
-        
-        # Create network function
+        self.rnns = []
+        params_flat_parts = []
+
         x = ca.SX.sym('x', self.NX)
-        self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [self.net(x.T)])
+        x_seq = ca.repmat(x, 1, self.N)
+
+        in_size = self.NX
+        hidden_seq = x_seq
+        output_seq = None
+        for layer_idx, size in enumerate(self.hidden_sizes):
+            is_last = layer_idx == len(self.hidden_sizes) - 1
+            out_size = self.NU if is_last else 0
+            rnn = ComplementarityRNN(
+                input_size=in_size,
+                hidden_size=size,
+                output_size=out_size,
+                complementarity=False,
+                use_bias=True,
+                output_bias=True,
+            )
+            params_layer, params_flat = rnn.create_parameters()
+            params_flat_parts.append(params_flat)
+
+            h0 = ca.SX.zeros(size, 1)
+            result = rnn.build(hidden_seq, h0=h0, params=params_layer)
+
+            self.rnns.append(rnn)
+            if is_last:
+                output_seq = result["output"]
+            else:
+                hidden_seq = result["hidden"]
+            in_size = size
+
+        self.params_flattened = ca.vertcat(*params_flat_parts)
+        self.n_param = int(self.params_flattened.shape[0])
+        print(f"Number of parameters in the RNN network: {self.n_param}")
+
+        output_vec = ca.reshape(output_seq, self.NU * self.N, 1)
+        self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [output_vec])
     
     def generate_test_states(self, n_test=20, seed=42):
         """Generate random initial states for testing.
@@ -163,7 +179,7 @@ class InvertedPendulumMPCComparison:
             Random seed for reproducibility.
         """
         np.random.seed(seed)
-        alpha = 0.3  # scaling factor to ensure test states are within training distribution
+        alpha = 0.5  # scaling factor to ensure test states are within training distribution
         self.theta_test_bound = self.inverted_pendulum.theta_bound * alpha
         self.omega_test_bound = self.inverted_pendulum.omega_bound * alpha
         
@@ -202,9 +218,9 @@ class InvertedPendulumMPCComparison:
     
     def load_learned_params(self):
         """Load parameters for the learned policy."""
-        model_name = get_model_name(self.layer_sizes)
+        model_name = get_model_name(self.hidden_sizes)
         params_file = self.find_latest_params(self.model_dir, model_name, "yaml")
-        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/optimal_params_ip_2x20x10_2026-03-02_14-55-53.yaml"
+        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_inverted_pendulum/optimal_params_ip_cc_10_2026-03-24_10-26-10.yaml"
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         self.params_init_vec = load_params(params_file)
@@ -241,7 +257,7 @@ class InvertedPendulumMPCComparison:
         # Solve MPC and simulate learned policy for each initial state
         for i, x0 in enumerate(self.initial_states):
             x0_list = x0.tolist()
-        
+            
             # Solve the MPC NLP
             u_opt = self.inverted_pendulum.solve_MPC(x0, ret_seq=True)
             
@@ -267,7 +283,7 @@ class InvertedPendulumMPCComparison:
             
             if (i + 1) % 5 == 0:
                 print(f"Completed {i + 1}/{N_TEST} test cases")
-            
+        
     def run_closed_loop_comparison(self, Nsim=60):
         """Run a closed-loop comparison between optimal MPC and learned policy.
         
@@ -412,7 +428,7 @@ class InvertedPendulumMPCComparison:
         print(f"  Suboptimality percentage (avg): {suboptimality_pct.mean():.2f}%")
         print(f"  Max suboptimality: {suboptimality_pct.max():.2f}%")
         print(f"  Min suboptimality: {suboptimality_pct.min():.2f}%")
-    
+        
     def plot_closed_loop_trajectories(self, Nsim):
         """Plot closed-loop trajectories for optimal MPC vs learned policy."""
         N_VALID = len(self.valid_indices)
@@ -556,8 +572,8 @@ class InvertedPendulumMPCComparison:
         avg_rmse_u = np.mean(self.rmse_u_batch)
 
         # Create a grid of states for plotting the policy
-        theta_grid = np.linspace(-self.theta_bound, self.theta_bound, 50)
-        omega_grid = np.linspace(-self.omega_bound, self.omega_bound, 50)
+        theta_grid = np.linspace(-self.inverted_pendulum.theta_bound, self.inverted_pendulum.theta_bound, 50)
+        omega_grid = np.linspace(-self.inverted_pendulum.omega_bound, self.inverted_pendulum.omega_bound, 50)
         Theta, Omega = np.meshgrid(theta_grid, omega_grid)
         X_grid = np.vstack([Theta.flatten(), Omega.flatten()])
 
@@ -601,38 +617,13 @@ class InvertedPendulumMPCComparison:
     def plot_errors(self):
         """Plot trajectory errors."""
         N_VALID = len(self.valid_indices)
-        avg_rmse_states = np.mean(self.rmse_states_batch, axis=0)
         avg_rmse_u = np.mean(self.rmse_u_batch)
         
-        t_x = np.arange(self.N + 1)
         t_u = np.arange(self.N)
         
-        plt.figure(figsize=(12, 10))
-        
-        # Error in state 1 (angle) over time
-        plt.subplot(3, 1, 1)
-        for i in range(N_VALID):
-            error_x1 = self.x_opt_batch[i][0, :] - self.x_sim_batch[i][0, :]
-            plt.plot(t_x, error_x1, '-', alpha=0.3, color='C0')
-        plt.plot([], [], '-', label=f'Avg RMSE={avg_rmse_states[0]:.3f}', color='C0')
-        plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-        plt.ylabel('Angle Error')
-        plt.grid(True)
-        plt.legend()
-        
-        # Error in state 2 (angular velocity) over time
-        plt.subplot(3, 1, 2)
-        for i in range(N_VALID):
-            error_x2 = self.x_opt_batch[i][1, :] - self.x_sim_batch[i][1, :]
-            plt.plot(t_x, error_x2, '-', alpha=0.3, color='C1')
-        plt.plot([], [], '-', label=f'Avg RMSE={avg_rmse_states[1]:.3f}', color='C1')
-        plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
-        plt.ylabel('Angular Velocity Error')
-        plt.grid(True)
-        plt.legend()
+        plt.figure()
         
         # Error in control over time
-        plt.subplot(3, 1, 3)
         for i in range(N_VALID):
             error_u = self.u_opt_batch[i].flatten() - self.u_sim_batch[i].flatten()
             plt.step(t_u, error_u, where='post', alpha=0.3, color='C4')
@@ -708,8 +699,8 @@ class InvertedPendulumMPCComparison:
 
 if __name__ == "__main__":
     # Create comparison object
-    comparison = InvertedPendulumMPCComparison(
-        layer_sizes=[2, 20, 10],
+    comparison = InvertedPendulumMPC_RNNComparison(
+        hidden_sizes=[10],
         beta=50.0,
         horizon=10,
         complemetarity=True
@@ -727,8 +718,8 @@ if __name__ == "__main__":
     # Generate plots
     comparison.plot_controls()
     comparison.plot_policy()
-    # comparison.plot_policy_3d()
+    # # comparison.plot_policy_3d()
     # comparison.plot_errors()
-    # comparison.plot_costs()
+    # # comparison.plot_costs()
     comparison.run_closed_loop_comparison(Nsim=30)
     comparison.show_plots()
