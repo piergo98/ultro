@@ -210,7 +210,7 @@ class InvertedPendulumMPCComparison:
         self.params_init_vec = load_params(params_file)
         print(f"Loaded parameters from {params_file}")
     
-    def run_comparison(self, wait_for_input=True):
+    def run_open_loop_comparison(self, wait_for_input=True):
         """Run the comparison between optimal MPC and learned policy.
         
         Parameters
@@ -419,37 +419,44 @@ class InvertedPendulumMPCComparison:
         print(f"Plotting closed-loop trajectories for {N_VALID} valid test cases...")
         t = self.inverted_pendulum.dt * np.arange(Nsim + 1)
         
-        plt.figure(figsize=(12, 5))
-        # Plot state trajectories
+        fig = plt.figure(figsize=(12, 8))
+        
+        # Plot angle trajectory
+        ax1 = plt.subplot(2, 2, 1)
         for i in range(N_VALID):
-            plt.subplot(1, 2, 1)
-            plt.plot(t, self.x_opt_batch[i][0, :], color='C0')
-            plt.plot(t, self.x_sim_batch[i][0, :], color='C1', linestyle='--')
-            plt.xlabel('Time Step')
-            plt.ylabel('Angle (rad)')
-            plt.title(f'Test Case {self.valid_indices[i]}: Angle Trajectory')
-            plt.grid(True)
-            
-            plt.subplot(1, 2, 2)
-            plt.plot(t, self.x_opt_batch[i][1, :], color='C0')
-            plt.plot(t, self.x_sim_batch[i][1, :], color='C1', linestyle='--')
-            plt.xlabel('Time Step')
-            plt.ylabel('Angular Velocity (rad/s)')
-            plt.title(f'Test Case {self.valid_indices[i]}: Angular Velocity Trajectory')
-            plt.grid(True)
+            ax1.plot(t, self.x_opt_batch[i][0, :], color='C0', alpha=0.3)
+            ax1.plot(t, self.x_sim_batch[i][0, :], color='C1', linestyle='--', alpha=0.3)
+        ax1.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax1.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax1.set_ylabel('Angle (rad)')
+        ax1.grid(True)
+        ax1.legend()
         
-        # Add generic legend
-        plt.subplot(1, 2, 1)
-        plt.plot([], [], color='C0', label='Optimal MPC')
-        plt.plot([], [], color='C1', linestyle='--', label='Learned Policy')
-        plt.legend()
+        # Plot angular velocity trajectory
+        ax2 = plt.subplot(2, 2, 2)
+        for i in range(N_VALID):
+            ax2.plot(t, self.x_opt_batch[i][1, :], color='C0', alpha=0.3)
+            ax2.plot(t, self.x_sim_batch[i][1, :], color='C1', linestyle='--', alpha=0.3)
+        ax2.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax2.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax2.set_ylabel('Angular Velocity (rad/s)')
+        ax2.grid(True)
+        ax2.legend()
         
-        plt.subplot(1, 2, 2)
-        plt.plot([], [], color='C0', label='Optimal MPC')
-        plt.plot([], [], color='C1', linestyle='--', label='Learned Policy')
-        plt.legend()
+        # Plot control trajectories
+        ax3 = plt.subplot(2, 1, 2)
+        for i in range(N_VALID):
+            ax3.plot(t[:-1], self.u_opt_batch[i].flatten(), color='C0', alpha=0.3)
+            ax3.plot(t[:-1], self.u_sim_batch[i].flatten(), color='C1', linestyle='--', alpha=0.3)
+        ax3.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax3.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Control Input (Nm)')
+        ax3.grid(True)
+        ax3.legend()
         
-        plt.suptitle(f'Closed-Loop Trajectories for Optimal MPC vs Learned Policy')
+        fig.suptitle(f'Closed-Loop Trajectories: Optimal MPC vs Learned Policy ({N_VALID} Valid Test Cases)')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
     
     def plot_controls(self):
         """Plot optimal vs learned trajectories."""
@@ -471,7 +478,7 @@ class InvertedPendulumMPCComparison:
         plt.grid(True)
         plt.legend()
         
-        plt.suptitle(f'Optimal vs Learned Policy ({N_VALID} Valid Test Cases)')
+        plt.suptitle(f'Open Loop Optimal vs Learned Policy ({N_VALID} Valid Test Cases)')
         plt.tight_layout(rect=[0, 0, 1, 0.96])
 
     def plot_policy(self):
@@ -719,7 +726,7 @@ if __name__ == "__main__":
     comparison.generate_test_states(n_test=200, seed=36)
     
     # Run comparison
-    comparison.run_comparison(wait_for_input=True)
+    comparison.run_open_loop_comparison(wait_for_input=True)
     
     # Print results
     # comparison.print_results(threshold_rmse=0.01)

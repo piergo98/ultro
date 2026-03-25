@@ -74,7 +74,7 @@ def load_params(params_file):
 class InvertedPendulumMPC_RNNComparison:
     """Class for comparing optimal MPC with learned neural network policy for inverted pendulum system."""
     
-    def __init__(self, hidden_sizes=[10], beta=0.5, horizon=20, complemetarity=False, model_dir=None):
+    def __init__(self, hidden_sizes=[10], beta=0.5, horizon=20, complementarity=False, model_dir=None):
         """Initialize the MPC comparison.
         
         Parameters
@@ -85,7 +85,7 @@ class InvertedPendulumMPC_RNNComparison:
             Softplus beta parameter.
         horizon : int
             MPC prediction horizon length.
-        complemetarity : bool
+        complementarity : bool
             Whether to include complementarity constraints in the MPC formulation.
         model_dir : Path or None
             Directory containing trained model parameters.
@@ -97,7 +97,7 @@ class InvertedPendulumMPC_RNNComparison:
         self.hidden_sizes = hidden_sizes
         self.beta = beta
         self.N = horizon
-        self.complementarity = complemetarity
+        self.complementarity = complementarity
         self.model_dir = model_dir if model_dir is not None else Path(__file__).parent.parent / "models_nn" / "rnn_inverted_pendulum"
         
         # Initialize inverted pendulum model
@@ -125,44 +125,33 @@ class InvertedPendulumMPC_RNNComparison:
         print(f"Setup completed in {time.time() - start_time:.2f} seconds")
     
     def _setup_network(self):
-        """Set up the neural network approximator."""
+        """Set up the RNN approximator."""
         set_sym_type("SX")
-        
-        self.rnns = []
-        params_flat_parts = []
 
         x = ca.SX.sym('x', self.NX)
         x_seq = ca.repmat(x, 1, self.N)
 
-        in_size = self.NX
         hidden_seq = x_seq
         output_seq = None
-        for layer_idx, size in enumerate(self.hidden_sizes):
-            is_last = layer_idx == len(self.hidden_sizes) - 1
-            out_size = self.NU if is_last else 0
-            rnn = ComplementarityRNN(
-                input_size=in_size,
-                hidden_size=size,
-                output_size=out_size,
-                complementarity=False,
-                use_bias=True,
-                output_bias=True,
-            )
-            params_layer, params_flat = rnn.create_parameters()
-            params_flat_parts.append(params_flat)
 
-            h0 = ca.SX.zeros(size, 1)
-            result = rnn.build(hidden_seq, h0=h0, params=params_layer)
+        rnn = ComplementarityRNN(
+            input_size=self.NX,
+            hidden_size=self.hidden_sizes,
+            output_size=self.NU,
+            complementarity=False,
+            output_bias=True,
+        )
+        # Build the RNN
+        h0 = np.zeros((self.hidden_sizes[0], 1))
+        result = rnn.build(hidden_seq, h0)
+        
+        # Get parameters from build result
+        self.params_flattened = result["params_flat"]
+        self.n_param = rnn.n_params
+        
+        output_seq = result["output"]
+        hidden_seq = result["hidden"]
 
-            self.rnns.append(rnn)
-            if is_last:
-                output_seq = result["output"]
-            else:
-                hidden_seq = result["hidden"]
-            in_size = size
-
-        self.params_flattened = ca.vertcat(*params_flat_parts)
-        self.n_param = int(self.params_flattened.shape[0])
         print(f"Number of parameters in the RNN network: {self.n_param}")
 
         output_vec = ca.reshape(output_seq, self.NU * self.N, 1)
@@ -220,7 +209,7 @@ class InvertedPendulumMPC_RNNComparison:
         """Load parameters for the learned policy."""
         model_name = get_model_name(self.hidden_sizes)
         params_file = self.find_latest_params(self.model_dir, model_name, "yaml")
-        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_inverted_pendulum/optimal_params_ip_cc_10_2026-03-24_10-26-10.yaml"
+        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_inverted_pendulum/optimal_params_ip_cc_20_2026-03-24_17-31-49.yaml"
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         self.params_init_vec = load_params(params_file)
@@ -435,37 +424,44 @@ class InvertedPendulumMPC_RNNComparison:
         print(f"Plotting closed-loop trajectories for {N_VALID} valid test cases...")
         t = self.inverted_pendulum.dt * np.arange(Nsim + 1)
         
-        plt.figure(figsize=(12, 5))
-        # Plot state trajectories
+        fig = plt.figure(figsize=(12, 8))
+        
+        # Plot angle trajectory
+        ax1 = plt.subplot(2, 2, 1)
         for i in range(N_VALID):
-            plt.subplot(1, 2, 1)
-            plt.plot(t, self.x_opt_batch[i][0, :], color='C0')
-            plt.plot(t, self.x_sim_batch[i][0, :], color='C1', linestyle='--')
-            plt.xlabel('Time Step')
-            plt.ylabel('Angle (rad)')
-            plt.title(f'Test Case {self.valid_indices[i]}: Angle Trajectory')
-            plt.grid(True)
-            
-            plt.subplot(1, 2, 2)
-            plt.plot(t, self.x_opt_batch[i][1, :], color='C0')
-            plt.plot(t, self.x_sim_batch[i][1, :], color='C1', linestyle='--')
-            plt.xlabel('Time Step')
-            plt.ylabel('Angular Velocity (rad/s)')
-            plt.title(f'Test Case {self.valid_indices[i]}: Angular Velocity Trajectory')
-            plt.grid(True)
+            ax1.plot(t, self.x_opt_batch[i][0, :], color='C0', alpha=0.3)
+            ax1.plot(t, self.x_sim_batch[i][0, :], color='C1', linestyle='--', alpha=0.3)
+        ax1.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax1.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax1.set_ylabel('Angle (rad)')
+        ax1.grid(True)
+        ax1.legend()
         
-        # Add generic legend
-        plt.subplot(1, 2, 1)
-        plt.plot([], [], color='C0', label='Optimal MPC')
-        plt.plot([], [], color='C1', linestyle='--', label='Learned Policy')
-        plt.legend()
+        # Plot angular velocity trajectory
+        ax2 = plt.subplot(2, 2, 2)
+        for i in range(N_VALID):
+            ax2.plot(t, self.x_opt_batch[i][1, :], color='C0', alpha=0.3)
+            ax2.plot(t, self.x_sim_batch[i][1, :], color='C1', linestyle='--', alpha=0.3)
+        ax2.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax2.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax2.set_ylabel('Angular Velocity (rad/s)')
+        ax2.grid(True)
+        ax2.legend()
         
-        plt.subplot(1, 2, 2)
-        plt.plot([], [], color='C0', label='Optimal MPC')
-        plt.plot([], [], color='C1', linestyle='--', label='Learned Policy')
-        plt.legend()
+        # Plot control trajectories
+        ax3 = plt.subplot(2, 1, 2)
+        for i in range(N_VALID):
+            ax3.plot(t[:-1], self.u_opt_batch[i].flatten(), color='C0', alpha=0.3)
+            ax3.plot(t[:-1], self.u_sim_batch[i].flatten(), color='C1', linestyle='--', alpha=0.3)
+        ax3.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax3.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax3.set_xlabel('Time (s)')
+        ax3.set_ylabel('Control Input (Nm)')
+        ax3.grid(True)
+        ax3.legend()
         
-        plt.suptitle(f'Closed-Loop Trajectories for Optimal MPC vs Learned Policy')
+        fig.suptitle(f'Closed-Loop Trajectories: Optimal MPC vs Learned Policy ({N_VALID} Valid Test Cases)')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
     
     def plot_controls(self):
         """Plot optimal vs learned trajectories."""
@@ -700,10 +696,9 @@ class InvertedPendulumMPC_RNNComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = InvertedPendulumMPC_RNNComparison(
-        hidden_sizes=[10],
-        beta=50.0,
+        hidden_sizes=[3, 3],
         horizon=10,
-        complemetarity=True
+        complementarity=True
     )
     
     # Generate test states
@@ -716,10 +711,10 @@ if __name__ == "__main__":
     # comparison.print_results(threshold_rmse=0.01)
     
     # Generate plots
-    comparison.plot_controls()
+    # comparison.plot_controls()
     comparison.plot_policy()
     # # comparison.plot_policy_3d()
     # comparison.plot_errors()
     # # comparison.plot_costs()
-    comparison.run_closed_loop_comparison(Nsim=30)
+    # comparison.run_closed_loop_comparison(Nsim=30)
     comparison.show_plots()

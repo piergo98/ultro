@@ -167,9 +167,6 @@ class CartPoleMPCComparison:
         if wait_for_input:
             input("Press Enter to start testing...")
         
-        # Set up MPC problem
-        self._setup_mpc()
-        
         print(f"Setup completed in {time.time() - start_time:.2f} seconds")
     
     def _setup_network(self):
@@ -196,130 +193,6 @@ class CartPoleMPCComparison:
         x = ca.SX.sym('x', self.NX)
         self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [self.net(x.T)])
     
-    def _build_integrator(self, f):
-        """Build RK4 integrator for dynamics.
-        
-        Parameters
-        ----------
-        f : ca.Function
-            Dynamics function.
-        
-        Returns
-        -------
-        f_dyn : ca.Function
-            Integrated dynamics function.
-        """
-        X0 = ca.MX.sym('X0', self.NX)
-        U = ca.MX.sym('U', self.NU)
-        M = 4  # RK4 steps per interval
-        DT = self.cart_pole.dt / M
-        Xk = X0
-        Q = 0
-        for j in range(M):
-            k1_x_dot, k1_l = f(Xk, U)
-            k2_x_dot, k2_l = f(Xk + DT/2 * k1_x_dot, U)
-            k3_x_dot, k3_l = f(Xk + DT/2 * k2_x_dot, U)
-            k4_x_dot, k4_l = f(Xk + DT * k3_x_dot, U)
-            Xk = Xk + (DT/6) * (k1_x_dot + 2*k2_x_dot + 2*k3_x_dot + k4_x_dot)
-            Q += (DT/6) * (k1_l + 2*k2_l + 2*k3_l + k4_l)
-        f_dyn = ca.Function('f_dyn', [X0, U], [Xk, Q], ['x', 'u'], ['x_next', 'l'])
-        
-        return f_dyn
-    
-    def _setup_mpc(self):
-        """Set up the MPC optimization problem."""
-        # Define dynamics and stage cost
-        x = ca.SX.sym('x', self.NX)
-        u = ca.SX.sym('u', self.NU)
-        # self.Q_mat = ca.DM(self.Q).reshape(self.NX, self.NX)  # state cost weights
-        # self.R_mat = ca.DM([1.0]).reshape(self.NU, self.NU)  # control cost weight
-        x_dot = self.cart_pole.dynamics(x, u)
-        self.xr = ca.DM([0.0, 0.0, 0.0, 0.0])  # reference state (upright pole)
-        self.ur = ca.DM([0.0])                  # reference control input
-        l = (x - self.xr).T @ self.Q @ (x - self.xr) + (u - self.ur).T @ self.R @ (u - self.ur)
-        f = ca.Function('f', [x, u], [x_dot, l], ['x', 'u'], ['x_dot', 'l'])
-        self.f_dyn = self._build_integrator(f)
-        
-        # Trajectory extraction functions
-        X = ca.SX.sym('X', self.NX, self.N + 1)  # state trajectory
-        U = ca.SX.sym('U', self.NU, self.N)    # control trajectory
-        decvar = ca.veccat(X[:,0], ca.vertcat(U, X[:,1:], ))
-        self.extract_traj = ca.Function("extract_traj", [decvar], [X, U])
-        self.traj_to_vec = ca.Function("traj_to_vec", [X, U], [decvar])
-        
-        # Create an NLP to minimize the cost over a horizon
-        w = []      # decision variables
-        self.w0 = []     # initial guess
-        lbw = []    # lower bounds
-        ubw = []    # upper bounds
-        J = 0       # objective
-        g = []      # constraints
-        lbg = []    # lower bounds on constraints
-        ubg = []    # upper bounds on constraints
-        
-        # State bounds
-        self.p_bound = 2.0
-        self.v_bound = 4.0
-        self.theta_bound = np.pi/3
-        self.omega_bound = 2.0
-        
-        # Control bounds
-        self.u_min = -10.0
-        self.u_max = 10.0
-        
-        # Initialize state as symbolic parameter
-        Xk = ca.SX.sym('X_0', self.NX)
-        w += [Xk]
-        lbw += [-self.p_bound, -self.v_bound, -self.theta_bound, -self.omega_bound]
-        ubw += [self.p_bound, self.v_bound, self.theta_bound, self.omega_bound]
-        self.w0 += [0.0]*self.NX
-        
-        for k in range(self.N):
-            u_k = ca.SX.sym('u_' + str(k), self.NU)
-            w += [u_k]
-            lbw += [self.u_min]*self.NU
-            ubw += [self.u_max]*self.NU
-            self.w0 += [0.0]*self.NU
-            
-            # Compute next state
-            Xk_next, l_k = self.f_dyn(Xk, u_k)
-            # Add state to decision variables
-            Xk = ca.SX.sym('X_' + str(k+1), self.NX)
-            w += [Xk]
-            lbw += [-self.p_bound, -self.v_bound, -self.theta_bound, -self.omega_bound]
-            ubw += [self.p_bound, self.v_bound, self.theta_bound, self.omega_bound]
-            self.w0 += [0.0]*self.NX
-            
-            # Add dynamics constraint
-            g += [Xk_next - Xk]
-            lbg += [0.0]*self.NX
-            ubg += [0.0]*self.NX
-                        
-            # Accumulate cost
-            J += l_k
-        
-        # Add final cost using linearized dynamics
-        x_eq = ca.DM([0.0, 0.0, 0.0, 0.0])  # equilibrium state (upright pole)
-        u_eq = ca.DM([0.0])                 # equilibrium control input
-        A, B = self.cart_pole.lin_dyn(x_eq, u_eq)
-        self.A = A
-        self.B = B
-        self.E = solve_continuous_are(A.full(), B.full(), self.Q.full(), self.R.full())
-        # Compute LQR gain matrix: K = R^{-1} * B^T * E
-        self.K = np.linalg.solve(self.R.full(), self.B.full().T @ self.E)
-        J += (Xk - self.xr).T @ ca.DM(self.E) @ (Xk - self.xr)
-        
-        # Store bounds
-        self.lbw = lbw
-        self.ubw = ubw
-        self.lbg = lbg
-        self.ubg = ubg
-        
-        # Create NLP solver
-        nlp = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g)}
-        opts = {"expand": False, "print_time": False, "ipopt": {"print_level": 0, "max_iter": 3000, "tol": 1e-8}}
-        self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
-    
     def generate_test_states(self, n_test=20, seed=42):
         """Generate random initial states for testing.
         
@@ -332,10 +205,10 @@ class CartPoleMPCComparison:
         """
         np.random.seed(seed)
         alpha = 0.5  # scaling factor to ensure test states are within training distribution
-        self.p_test_bound = self.p_bound * alpha
-        self.v_test_bound = self.v_bound * alpha
-        self.theta_test_bound = self.theta_bound * alpha
-        self.omega_test_bound = self.omega_bound * alpha
+        self.p_test_bound = self.cart_pole.p_bound * alpha
+        self.v_test_bound = self.cart_pole.v_bound * alpha
+        self.theta_test_bound = self.cart_pole.theta_bound * alpha
+        self.omega_test_bound = self.cart_pole.omega_bound * alpha
         
         self.initial_states = np.zeros((n_test, self.NX))
         self.initial_states[:, 0] = np.random.uniform(-self.p_test_bound, self.p_test_bound, n_test)
@@ -369,7 +242,7 @@ class CartPoleMPCComparison:
         
         print(f"Loaded parameters from {params_file}")
     
-    def run_comparison(self):
+    def run_open_loop_comparison(self):
         """Run the comparison between optimal MPC and learned policy."""
         
         N_TEST = len(self.initial_states)
@@ -390,60 +263,24 @@ class CartPoleMPCComparison:
         for i, x0 in enumerate(self.initial_states):
             x0_list = x0.tolist()
             
-            # Set bounds for initial state
-            lbw_i = self.lbw.copy()
-            ubw_i = self.ubw.copy()
-            lbw_i[:self.NX] = x0_list
-            ubw_i[:self.NX] = x0_list
-            
             # Solve the MPC NLP
-            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
-            
-            # Extract the optimal solution
-            w_opt = solution['x'].full().flatten()
+            u_opt = self.cart_pole.solve_MPC(x0, ret_seq=True)
             
             # Extract optimal state and control trajectories
-            x_opt, u_opt = self.extract_traj(w_opt)
-            x_opt = np.asarray(x_opt)
             u_opt = np.asarray(u_opt)
 
             # Simulate the learned policy for the same initial state
-            x_sim = np.zeros((self.NX, self.N + 1))
             u_sim = np.zeros((self.NU, self.N))
-            x_sim[:, 0] = x0
-            for k in range(self.N):
-                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
-                u_sim[:, k] = u_next
-                x_next, _ = self.f_dyn(x_sim[:, k], u_sim[:, k])
-                x_sim[:, k + 1] = x_next.full().flatten()
-            
-            # Check for NaN values in the simulation
-            has_nan = np.isnan(x_sim).any() or np.isnan(u_sim).any()
-            if has_nan:
-                print(f"  Warning: Test case {i} produced NaN values, skipping...")
-                print(f"    Initial state: {x0}")
-                continue
+            u_sim = self.net_fcn(x0, self.params_init_vec).full().flatten().reshape(self.NU, self.N)
             
             # Store results for valid test case
-            self.x_opt_batch.append(x_opt)
             self.u_opt_batch.append(u_opt)
-            self.x_sim_batch.append(x_sim)
             self.u_sim_batch.append(u_sim)
             self.valid_indices.append(i)
             
             # Compute RMSE for states and control
-            rmse_states = np.sqrt(np.mean((x_opt - x_sim) ** 2, axis=1))
             rmse_u = np.sqrt(np.mean((u_opt - u_sim) ** 2))
-            self.rmse_states_batch.append(rmse_states)
             self.rmse_u_batch.append(rmse_u)
-            
-            # Compute cost for optimal trajectory
-            cost_opt = self._compute_trajectory_cost(x_opt, u_opt)
-            self.cost_opt_batch.append(cost_opt)
-            
-            # Compute cost for simulated trajectory
-            cost_sim = self._compute_trajectory_cost(x_sim, u_sim)
-            self.cost_sim_batch.append(cost_sim)
             
             if (i + 1) % 5 == 0:
                 print(f"Completed {i + 1}/{N_TEST} test cases")
@@ -455,53 +292,77 @@ class CartPoleMPCComparison:
             print(f"\n{N_INVALID} test case(s) were skipped due to NaN values.")
         print(f"Analyzing {N_VALID} valid test cases...\n")
         
-    def close_loop_simulation(self, x0, Nsim=100):
-        """Test the learned policy in closed-loop simulation from a given initial state."""
-        x_sim = np.zeros((self.NX, Nsim + 1))
-        u_sim = np.zeros((self.NU, Nsim))
-        x_sim[:, 0] = x0
-        for k in range(Nsim):
-            u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
-            u_sim[:, k] = u_next
-            x_next, _ = self.f_dyn(x_sim[:, k], u_sim[:, k])
-            x_sim[:, k + 1] = x_next.full().flatten()
+    def run_closed_loop_comparison(self, Nsim=60):
+        """Run a closed-loop comparison between optimal MPC and learned policy.
         
-        # Check for NaN values in the simulation
-        has_nan = np.isnan(x_sim).any() or np.isnan(u_sim).any()
-        if has_nan:
-            print(f"Warning: Closed-loop simulation produced NaN values.")
-            print(f"Initial state: {x0}")
-            return None, None
+        Parameters
+        ----------
+        Nsim : int
+            Number of simulation steps.
+        wait_for_input : bool
+            Whether to wait for user input before starting.
+        """
+        if self.initial_states is None:
+            raise ValueError("Generate test states first using generate_test_states()")
         
-        # Plot results
-        time = np.arange(Nsim + 1) * self.cart_pole.dt
-        time_u = np.arange(Nsim) * self.cart_pole.dt
-        fig, axes = plt.subplots(5, 1, figsize=(10, 10))
-        title = "Closed-Loop Simulation with Learned Policy"
-        axes[0].plot(time, x_sim[0, :], label='Position')
-        axes[0].set_ylabel('Position')
-        axes[0].grid(True)
-        axes[0].legend()
-        axes[1].plot(time, x_sim[1, :], label='Velocity') 
-        axes[1].set_ylabel('Velocity')
-        axes[1].grid(True)
-        axes[1].legend()
-        axes[2].plot(time, x_sim[2, :], label='Angle')
-        axes[2].set_ylabel('Angle')
-        axes[2].grid(True)
-        axes[2].legend()
-        axes[3].plot(time, x_sim[3, :], label='Angular Velocity')
-        axes[3].set_ylabel('Angular Velocity')
-        axes[3].grid(True)
-        axes[3].legend()
-        axes[4].plot(time_u, u_sim[0, :], label='Control Input')
-        axes[4].set_ylabel('Control Input')
-        axes[4].set_xlabel('Time (s)')
-        axes[4].grid(True)
-        axes[4].legend()
-        plt.suptitle(title)
-        plt.tight_layout()
-        # plt.show()
+        if not hasattr(self, 'params_init_vec'):
+            self.load_learned_params()
+        
+        N_TEST = len(self.initial_states)
+        print(f"Running closed-loop comparison for {N_TEST} initial states...")
+        
+        # Clear previous results
+        self.x_opt_batch = []
+        self.u_opt_batch = []
+        self.x_sim_batch = []
+        self.u_sim_batch = []
+        self.rmse_states_batch = []
+        self.rmse_u_batch = []
+        self.cost_opt_batch = []
+        self.cost_sim_batch = []
+        self.valid_indices = []
+        
+        # Run closed-loop simulation for each initial state
+        for i, x0 in enumerate(self.initial_states):
+            x0_list = x0.tolist()
+
+            # Simulate the learned policy in closed loop for the same initial state
+            x_sim = np.zeros((self.NX, Nsim + 1))
+            u_sim = np.zeros((self.NU, Nsim))
+            x_sim[:, 0] = x0
+            for k in range(Nsim):
+                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
+                u_sim[:, k] = u_next
+                x_next = self.cart_pole.step(x_sim[:, k], u_next)
+                x_sim[:, k + 1] = np.array(x_next.full()).flatten()
+                
+            # Simulate closed-loop optimal MPC trajectory for the same initial state
+            x_opt_sim, u_opt_sim = self.cart_pole.close_loop_simulation(
+                x0,
+                Nsim,
+                plot_results=False
+            )
+            
+            # Check for NaN values in trajectories
+            if np.isnan(x_sim).any() or np.isnan(u_sim).any():
+                print(f"Test case {i} contains NaN values. Skipping this case.")
+                continue
+            
+            # Store results
+            self.x_opt_batch.append(x_opt_sim.T)
+            self.u_opt_batch.append(u_opt_sim.T)
+            self.x_sim_batch.append(x_sim)
+            self.u_sim_batch.append(u_sim)
+            self.valid_indices.append(i)
+            
+        # Report on valid test cases
+        N_VALID = len(self.valid_indices)
+        N_INVALID = N_TEST - N_VALID
+        if N_INVALID > 0:
+            print(f"\n{N_INVALID} test case(s) were skipped due to NaN values.")
+        print(f"Analyzing {N_VALID} valid test cases...\n")
+            
+        self.plot_closed_loop_trajectories(Nsim)
     
     def _compute_trajectory_cost(self, x_traj, u_traj):
         """Compute the total cost for a trajectory.
@@ -579,68 +440,84 @@ class CartPoleMPCComparison:
         print(f"  Suboptimality percentage (avg): {suboptimality_pct.mean():.2f}%")
         print(f"  Max suboptimality: {suboptimality_pct.max():.2f}%")
         print(f"  Min suboptimality: {suboptimality_pct.min():.2f}%")
+        
+    def plot_closed_loop_trajectories(self, Nsim):
+        """Plot closed-loop trajectories for optimal MPC vs learned policy."""
+        N_VALID = len(self.valid_indices)
+        print(f"Plotting closed-loop trajectories for {N_VALID} valid test cases...")
+        t = self.cart_pole.dt * np.arange(Nsim + 1)
+        
+        fig = plt.figure(figsize=(12, 8))
+        
+        # Plot position trajectory
+        ax1 = plt.subplot(3, 2, 1)
+        for i in range(N_VALID):
+            ax1.plot(t, self.x_opt_batch[i][0, :], color='C0', alpha=0.3)
+            ax1.plot(t, self.x_sim_batch[i][0, :], color='C1', linestyle='--', alpha=0.3)
+        ax1.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax1.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax1.set_ylabel('Position (m)')
+        ax1.grid(True)
+        ax1.legend()
+        
+        # Plot velocity trajectory
+        ax2 = plt.subplot(3, 2, 2)
+        for i in range(N_VALID):
+            ax2.plot(t, self.x_opt_batch[i][1, :], color='C0', alpha=0.3)
+            ax2.plot(t, self.x_sim_batch[i][1, :], color='C1', linestyle='--', alpha=0.3)
+        ax2.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax2.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax2.set_ylabel('Velocity (m/s)')
+        ax2.grid(True)
+        ax2.legend()
+        
+        # Plot angle trajectory
+        ax3 = plt.subplot(3, 2, 3)
+        for i in range(N_VALID):
+            ax3.plot(t, self.x_opt_batch[i][2, :], color='C0', alpha=0.3)
+            ax3.plot(t, self.x_sim_batch[i][2, :], color='C1', linestyle='--', alpha=0.3)
+        ax3.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax3.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax3.set_ylabel('Angle (rad)')
+        ax3.grid(True)
+        ax3.legend()
+        
+        # Plot angular velocity trajectory
+        ax4 = plt.subplot(3, 2, 4)
+        for i in range(N_VALID):
+            ax4.plot(t, self.x_opt_batch[i][3, :], color='C0', alpha=0.3)
+            ax4.plot(t, self.x_sim_batch[i][3, :], color='C1', linestyle='--', alpha=0.3)
+        ax4.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax4.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax4.set_ylabel('Angular Velocity (rad/s)')
+        ax4.grid(True)
+        ax4.legend()
+        
+        # Plot control trajectories across the entire row
+        ax5 = plt.subplot(3, 1, 3)
+        for i in range(N_VALID):
+            ax5.plot(t[:-1], self.u_opt_batch[i].flatten(), color='C0', alpha=0.3)
+            ax5.plot(t[:-1], self.u_sim_batch[i].flatten(), color='C1', linestyle='--', alpha=0.3)
+        ax5.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
+        ax5.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
+        ax5.set_xlabel('Time (s)')
+        ax5.set_ylabel('Control Input (Nm)')
+        ax5.grid(True)
+        ax5.legend()
+        
+        fig.suptitle(f'Closed-Loop Trajectories: Optimal MPC vs Learned Policy')
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
     
-    def plot_trajectories(self):
+    def plot_controls(self):
         """Plot optimal vs learned trajectories."""
         N_VALID = len(self.valid_indices)
-        avg_rmse_states = np.mean(self.rmse_states_batch, axis=0)
         avg_rmse_u = np.mean(self.rmse_u_batch)
         
-        t_x = np.arange(self.N + 1)
-        t_u = np.arange(self.N)
+        t_u = self.cart_pole.dt * np.arange(self.N)
         
-        plt.figure(figsize=(12, 10))
-        
-        # State 1 (position) over time
-        plt.subplot(5, 1, 1)
-        for i in range(N_VALID):
-            plt.plot(t_x, self.x_opt_batch[i][0, :], '-', alpha=0.3, color='C0')
-            plt.plot(t_x, self.x_sim_batch[i][0, :], '-', alpha=0.3, color='C1')
-        plt.plot([], [], '-', label=f'Optimal (Avg RMSE={avg_rmse_states[0]:.3f})', color='C0')
-        plt.plot([], [], '-', label='Learned', color='C1')
-        plt.ylim(-2.0, 2.0)
-        plt.ylabel('Position')
-        plt.grid(True)
-        plt.legend()
-        
-        # State 2 (velocity) over time
-        plt.subplot(5, 1, 2)
-        for i in range(N_VALID):
-            plt.plot(t_x, self.x_opt_batch[i][1, :], '-', alpha=0.3, color='C0')
-            plt.plot(t_x, self.x_sim_batch[i][1, :], '-', alpha=0.3, color='C1')
-        plt.plot([], [], '-', label=f'Optimal (Avg RMSE={avg_rmse_states[1]:.3f})', color='C0')
-        plt.plot([], [], '-', label='Learned', color='C1')
-        plt.ylim(-4.0, 4.0)
-        plt.ylabel('Velocity')
-        plt.grid(True)
-        plt.legend()
-        
-        # State 3 (angle) over time
-        plt.subplot(5, 1, 3)
-        for i in range(N_VALID):
-            plt.plot(t_x, self.x_opt_batch[i][2, :], '-', alpha=0.3, color='C0')
-            plt.plot(t_x, self.x_sim_batch[i][2, :], '-', alpha=0.3, color='C1')
-        plt.plot([], [], '-', label=f'Optimal (Avg RMSE={avg_rmse_states[2]:.3f})', color='C0')
-        plt.plot([], [], '-', label='Learned', color='C1')
-        plt.ylim(-np.pi/3, np.pi/3)
-        plt.ylabel('Angle')
-        plt.grid(True)
-        plt.legend()
-        
-        # State 4 (angular velocity) over time
-        plt.subplot(5, 1, 4)
-        for i in range(N_VALID):
-            plt.plot(t_x, self.x_opt_batch[i][3, :], '-', alpha=0.3, color='C0')
-            plt.plot(t_x, self.x_sim_batch[i][3, :], '-', alpha=0.3, color='C1')
-        plt.plot([], [], '-', label=f'Optimal (Avg RMSE={avg_rmse_states[3]:.3f})', color='C0')
-        plt.plot([], [], '-', label='Learned', color='C1')
-        plt.ylim(-2.0, 2.0)
-        plt.ylabel('Angular Velocity')
-        plt.grid(True)
-        plt.legend()
+        # plt.figure(figsize=(12, 10))
         
         # Control over time
-        plt.subplot(5, 1, 5)
         for i in range(N_VALID):
             plt.step(t_u, self.u_opt_batch[i].flatten(), where='post', alpha=0.3, color='C2')
             plt.step(t_u, self.u_sim_batch[i].flatten(), where='post', alpha=0.3, color='C3')
@@ -651,7 +528,7 @@ class CartPoleMPCComparison:
         plt.grid(True)
         plt.legend()
         
-        plt.suptitle(f'Optimal vs Learned Policy ({N_VALID} Valid Test Cases)')
+        plt.suptitle(f'Open Loop Optimal vs Learned Policy ({N_VALID} Valid Test Cases)')
         plt.tight_layout(rect=[0, 0, 1, 0.96])
     
     def plot_errors(self):
@@ -786,104 +663,73 @@ class CartPoleMPCComparison:
         (position=0, velocity=0, angular_velocity=0).
         """
         # Create a grid of position for plotting the policy
-        grid = np.linspace(-self.theta_test_bound, self.theta_test_bound, 50)
+        grid = np.linspace(-self.cart_pole.theta_bound, self.cart_pole.theta_bound, 50)
 
         # Compute optimal control, learned control, and LQR control on the grid
         U_opt_grid = np.zeros(grid.shape[0])
         U_learned_grid = np.zeros(grid.shape[0])
-        U_lqr_grid = np.zeros(grid.shape[0])
 
         for i in range(grid.shape[0]):
             # State: [position, velocity, angle, angular_velocity]
             x_i = np.array([0.0, 0.0, grid[i], 0.0])
             
             # Solve MPC for this state to get optimal control
-            lbw_i = self.lbw.copy()
-            ubw_i = self.ubw.copy()
-            lbw_i[:self.NX] = x_i.tolist()
-            ubw_i[:self.NX] = x_i.tolist()
-            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
-            w_opt = solution['x'].full().flatten()
-            _, u_opt_traj = self.extract_traj(w_opt)
-            U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
+            U_opt_grid[i] = self.cart_pole.solve_MPC(x_i, ret_seq=False)
 
             # Compute learned control
             U_learned_grid[i] = self.net_fcn(x_i.tolist(), self.params_init_vec).full().flatten()[0]
-            
-            # Compute LQR control: u = -K * (x - x_ref)
-            x_ref = self.xr.full().flatten()
-            U_lqr_grid[i] = (-self.K @ (x_i - x_ref))[0]
+
+            # Compute learned control
+            U_learned_grid[i] = self.net_fcn(x_i.tolist(), self.params_init_vec).full().flatten()[0]
 
         # Reshape for plotting
         U_opt_grid = U_opt_grid.reshape(grid.shape)
         U_learned_grid = U_learned_grid.reshape(grid.shape)
-        U_lqr_grid = U_lqr_grid.reshape(grid.shape)
         
         # Compute errors
         U_error_learned = np.abs(U_opt_grid - U_learned_grid)
-        U_error_lqr = np.abs(U_lqr_grid - U_learned_grid)
 
-        fig = plt.figure(figsize=(16, 10))
+        fig = plt.figure(figsize=(12, 8))
         
         # First row: Optimal, Learned, and LQR policies
-        ax1 = fig.add_subplot(2, 3, 1)
+        ax1 = fig.add_subplot(2, 2, 1)
         ax1.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
         ax1.set_title('Optimal Control Policy')
         ax1.set_xlabel('Angle (rad)')
-        ax1.set_ylabel('Control Force (N)')
+        ax1.set_ylabel('Control Torque (Nm)')
         ax1.grid(True)
         ax1.legend()
 
-        ax2 = fig.add_subplot(2, 3, 2)
+        ax2 = fig.add_subplot(2, 2, 2)
         ax2.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, label='Learned NN')
         ax2.set_title(f'Learned Control Policy')
         ax2.set_xlabel('Angle (rad)')
-        ax2.set_ylabel('Control Force (N)')
+        ax2.set_ylabel('Control Torque (Nm)')
         ax2.grid(True)
         ax2.legend()
         
-        ax3 = fig.add_subplot(2, 3, 3)
-        ax3.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, label='LQR')
-        ax3.set_title('LQR Control Policy')
+        # Second row: Comparison and errors
+        ax3 = fig.add_subplot(2, 2, 3)
+        ax3.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
+        ax3.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, linestyle='--', label='Learned NN')
+        ax3.set_title('All Policies Comparison')
         ax3.set_xlabel('Angle (rad)')
-        ax3.set_ylabel('Control Force (N)')
+        ax3.set_ylabel('Control Torque (Nm)')
         ax3.grid(True)
         ax3.legend()
         
-        # Second row: Comparison and errors
-        ax4 = fig.add_subplot(2, 3, 4)
-        ax4.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
-        ax4.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, linestyle='--', label='Learned NN')
-        ax4.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, linestyle=':', label='LQR')
-        ax4.set_title('All Policies Comparison')
+        ax4 = fig.add_subplot(2, 2, 4)
+        ax4.semilogy(grid, U_error_learned.flatten(), alpha=0.7, color='C2', linewidth=2, label='Learned error')
+        ax4.set_title('|Optimal - Learned| (log scale)')
         ax4.set_xlabel('Angle (rad)')
-        ax4.set_ylabel('Control Force (N)')
-        ax4.grid(True)
+        ax4.set_ylabel('|Error| (Nm)')
+        ax4.grid(True, which='both')
         ax4.legend()
-        
-        ax5 = fig.add_subplot(2, 3, 5)
-        ax5.semilogy(grid, U_error_learned.flatten(), alpha=0.7, color='C2', linewidth=2, label='Learned error')
-        ax5.set_title('|Optimal - Learned| (log scale)')
-        ax5.set_xlabel('Angle (rad)')
-        ax5.set_ylabel('|Error| (N)')
-        ax5.grid(True, which='both')
-        ax5.legend()
-        
-        ax6 = fig.add_subplot(2, 3, 6)
-        ax6.semilogy(grid, U_error_lqr.flatten(), alpha=0.7, color='C4', linewidth=2, label='LQR error')
-        ax6.set_title('|LQR - Learned| (log scale)')
-        ax6.set_xlabel('Angle (rad)')
-        ax6.set_ylabel('|Error| (N)')
-        ax6.grid(True, which='both')
-        ax6.legend()
 
         plt.tight_layout()
     
     def plot_policy_3d(self, elev=30, azim=-60):
-        """3D surface plot of optimal, learned, and LQR control policies.
-        
-        Plots control as a function of angle and angular velocity, with other states
-        fixed at zero (position=0, velocity=0).
+        """3D surface plot of optimal and learned control policies.
 
         Parameters
         ----------
@@ -892,71 +738,48 @@ class CartPoleMPCComparison:
         azim : float
             Azimuth angle for 3D view.
         """
+        avg_rmse_u = np.mean(self.rmse_u_batch)
+
         # Create a grid of states for plotting the policy
-        theta_grid = np.linspace(-self.theta_bound, self.theta_bound, 50)
-        omega_grid = np.linspace(-self.omega_bound, self.omega_bound, 50)
+        theta_grid = np.linspace(-self.cart_pole.theta_bound, self.cart_pole.theta_bound, 50)
+        omega_grid = np.linspace(-self.cart_pole.omega_bound, self.cart_pole.omega_bound, 50)
         Theta, Omega = np.meshgrid(theta_grid, omega_grid)
         X_grid = np.vstack([Theta.flatten(), Omega.flatten()])
 
-        # Compute optimal control, learned control, and LQR control on the grid
+        # Compute optimal control and learned control on the grid
         U_opt_grid = np.zeros(X_grid.shape[1])
         U_learned_grid = np.zeros(X_grid.shape[1])
-        U_lqr_grid = np.zeros(X_grid.shape[1])
 
         for i in range(X_grid.shape[1]):
-            # State: [position, velocity, angle, angular_velocity]
             x_i = np.array([0.0, 0.0, X_grid[0, i], X_grid[1, i]])
-            
             # Solve MPC for this state to get optimal control
-            lbw_i = self.lbw.copy()
-            ubw_i = self.ubw.copy()
-            lbw_i[:self.NX] = x_i.tolist()
-            ubw_i[:self.NX] = x_i.tolist()
-            solution = self.solver(x0=self.w0, lbx=lbw_i, ubx=ubw_i, lbg=self.lbg, ubg=self.ubg)
-            w_opt = solution['x'].full().flatten()
-            _, u_opt_traj = self.extract_traj(w_opt)
-            U_opt_grid[i] = u_opt_traj[0, 0]  # first control input
+            U_opt_grid[i] = self.cart_pole.solve_MPC(x_i, ret_seq=False)
 
             # Compute learned control
-            U_learned_grid[i] = self.net_fcn(x_i.tolist(), self.params_init_vec).full().flatten()[0]
-            
-            # Compute LQR control: u = -K * (x - x_ref)
-            x_ref = self.xr.full().flatten()
-            U_lqr_grid[i] = (-self.K @ (x_i - x_ref))[0]
+            U_learned_grid[i] = self.net_fcn(x_i, self.params_init_vec).full().flatten()[0]
 
         # Reshape for plotting
         U_opt_grid = U_opt_grid.reshape(Theta.shape)
         U_learned_grid = U_learned_grid.reshape(Theta.shape)
-        U_lqr_grid = U_lqr_grid.reshape(Theta.shape)
 
-        fig = plt.figure(figsize=(18, 6))
-        
-        ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+        fig = plt.figure(figsize=(14, 6))
+        ax1 = fig.add_subplot(1, 2, 1, projection='3d')
         surf1 = ax1.plot_surface(Theta, Omega, U_opt_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
         fig.colorbar(surf1, ax=ax1, shrink=0.6)
         ax1.set_title('Optimal Control Policy (3D)')
         ax1.set_xlabel('Angle (rad)')
         ax1.set_ylabel('Angular Velocity (rad/s)')
-        ax1.set_zlabel('Control Force (N)')
+        ax1.set_zlabel('Control')
         ax1.view_init(elev=elev, azim=azim)
 
-        ax2 = fig.add_subplot(1, 3, 2, projection='3d')
+        ax2 = fig.add_subplot(1, 2, 2, projection='3d')
         surf2 = ax2.plot_surface(Theta, Omega, U_learned_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
         fig.colorbar(surf2, ax=ax2, shrink=0.6)
         ax2.set_title(f'Learned Policy (3D)')
         ax2.set_xlabel('Angle (rad)')
         ax2.set_ylabel('Angular Velocity (rad/s)')
-        ax2.set_zlabel('Control Force (N)')
+        ax2.set_zlabel('Control')
         ax2.view_init(elev=elev, azim=azim)
-        
-        ax3 = fig.add_subplot(1, 3, 3, projection='3d')
-        surf3 = ax3.plot_surface(Theta, Omega, U_lqr_grid, cmap='viridis', rcount=50, ccount=50, linewidth=0, antialiased=True)
-        fig.colorbar(surf3, ax=ax3, shrink=0.6)
-        ax3.set_title('LQR Control Policy (3D)')
-        ax3.set_xlabel('Angle (rad)')
-        ax3.set_ylabel('Angular Velocity (rad/s)')
-        ax3.set_zlabel('Control Force (N)')
-        ax3.view_init(elev=elev, azim=azim)
 
         plt.tight_layout()
     
@@ -977,21 +800,12 @@ if __name__ == "__main__":
     comparison.generate_test_states(n_test=200, seed=36)
     
     # Run comparison
-    # comparison.run_comparison()
-    
-    # Print results
-    # comparison.print_results(threshold_rmse=0.01)
-    
-    # Test closed-loop simulation from a specific initial state
-    # Extract an initial state from the test cases
-    x0_test = comparison.initial_states[np.random.choice(comparison.initial_states.shape[0]), :].tolist()
-    comparison.close_loop_simulation(x0_test, Nsim=100)
+    comparison.run_open_loop_comparison()
 
     
     # Generate plots
-    # comparison.plot_trajectories()
+    comparison.plot_controls()
     comparison.plot_policy()
-    # comparison.plot_policy_3d()
-    # comparison.plot_errors()
-    # comparison.plot_costs()
+    comparison.run_closed_loop_comparison(Nsim=30)
+
     comparison.show_plots()
