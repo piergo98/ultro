@@ -22,6 +22,7 @@ class LinearSystem:
         self.step = self.step_func()
         
         self.good_initial_points = 0
+        self.skip = False
         
         self.N = N  # MPC horizon length
         Q = np.diag([1.0, 1.0, 1.0, 1.0])  # state cost weight
@@ -32,7 +33,7 @@ class LinearSystem:
         """Compute the next state given current state and control input."""
         x = ca.SX.sym("x", self.nx)
         u = ca.SX.sym("u", self.nu)
-        x_next =self.A @ x + self.B @ u
+        x_next = self.A @ x + self.B @ u
         return ca.Function("step", [x, u], [x_next])
     
     def define_simple_MPC_control(self, N, Q, R):
@@ -192,6 +193,9 @@ class LinearSystem:
         if control_policy is None:
             if self.solver.stats()['success']:
                 self.good_initial_points += 1
+            else:
+                # print(self.solver.stats()['return_status'])
+                self.skip = True
         
         if not plot_results:
             return x_traj, u_traj
@@ -247,7 +251,7 @@ if __name__ == "__main__":
     
     # Create linear system instance
     lin_sys = LinearSystem(A, B, dt=0.1)
-    Ncsim = 1000
+    Ncsim = 200
     
     # Example usage: simulate with zero control input
     alpha = 0.3
@@ -255,7 +259,7 @@ if __name__ == "__main__":
     v_bound = 1.0 * alpha 
     theta_bound = 1.0 * alpha
     omega_bound = 0.35 * alpha
-    np.random.seed(42)  # for reproducibility
+    np.random.seed(36)  # for reproducibility
     for _ in range(Ncsim):
         p0 = np.random.uniform(-p_bound, p_bound)
         v0 = np.random.uniform(-v_bound, v_bound)

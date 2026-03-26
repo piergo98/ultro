@@ -381,6 +381,7 @@ class LinearMPCComparison:
         if params_file is None:
             model_name = get_model_name(self.layer_sizes)
             params_file = find_latest_params(self.model_dir, model_name, "yaml")
+            params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/linear_mpc/optimal_params_lin_4x20x20x10_2026-03-13_11-41-08.yaml"
             if params_file is None:
                 raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         
@@ -601,10 +602,10 @@ class LinearMPCComparison:
         # Control over time
         plt.subplot(self.nx + 1, 1, self.nx + 1)
         for i in range(N_VALID):
-            plt.step(t_u, self.u_opt_batch[i].flatten(), where='post', alpha=0.3, color='C2')
-            plt.step(t_u, self.u_sim_batch[i].flatten(), where='post', alpha=0.3, color='C3')
-        plt.step([], [], where='post', label=f'Optimal (RMSE={avg_rmse_u:.3f})', color='C2')
-        plt.step([], [], where='post', label='Learned', color='C3')
+            plt.plot(t_u, self.u_opt_batch[i].flatten(), alpha=0.3, color='C2')
+            plt.plot(t_u, self.u_sim_batch[i].flatten(), alpha=0.3, color='C3')
+        plt.plot([], [], label=f'Optimal (RMSE={avg_rmse_u:.3f})', color='C2')
+        plt.plot([], [], label='Learned', color='C3')
         plt.xlabel('Time Step')
         plt.ylabel('Control')
         plt.grid(True, alpha=0.3)
@@ -644,8 +645,8 @@ class LinearMPCComparison:
         plt.subplot(self.nx + 1, 1, self.nx + 1)
         for i in range(N_VALID):
             error_u = self.u_opt_batch[i].flatten() - self.u_sim_batch[i].flatten()
-            plt.step(t_u, error_u, where='post', alpha=0.3, color='C1')
-        plt.step([], [], where='post', label=f'Avg RMSE={avg_rmse_u:.3f}', color='C1')
+            plt.plot(t_u, error_u, alpha=0.3, color='C1')
+        plt.plot([], [], '-', label=f'Avg RMSE={avg_rmse_u:.3f}', color='C1')
         plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
         plt.xlabel('Time Step')
         plt.ylabel('Control Error')
@@ -840,6 +841,7 @@ class LinearMPCComparison:
         
         # Compute errors
         U_error_learned = np.abs(U_opt_grid - U_learned_grid)
+        print(f"Max error between optimal and learned policy: {U_error_learned.max():.4f} at angle {grid[U_error_learned.argmax()]:.4f} rad")
         U_error_lqr = np.abs(U_lqr_grid - U_learned_grid)
 
         fig = plt.figure(figsize=(16, 10))
@@ -873,7 +875,7 @@ class LinearMPCComparison:
         ax4 = fig.add_subplot(2, 3, 4)
         ax4.plot(grid, U_opt_grid.flatten(), alpha=0.7, color='C0', linewidth=2, label='Optimal MPC')
         ax4.plot(grid, U_learned_grid.flatten(), alpha=0.7, color='C1', linewidth=2, linestyle='--', label='Learned NN')
-        ax4.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, linestyle=':', label='LQR')
+        # ax4.plot(grid, U_lqr_grid.flatten(), alpha=0.7, color='C3', linewidth=2, linestyle=':', label='LQR')
         ax4.set_title('All Policies Comparison')
         ax4.set_xlabel('Angle (rad)')
         ax4.set_ylabel('Control Force (N)')
@@ -948,24 +950,24 @@ if __name__ == "__main__":
             mpc_nn_system.load_learned_params()
             
             # Generate test states
-            mpc_nn_system.generate_test_states(n_test=50, seed=36)
+            mpc_nn_system.generate_test_states(n_test=200, seed=36)
             
             # Run comparison
             print("Running comparison between optimal MPC and learned policy...")
-            # mpc_nn_system.run_comparison()
+            mpc_nn_system.run_comparison()
             
             # Print results
-            # mpc_nn_system.print_results()
+            mpc_nn_system.print_results()
             
             # Generate plots
             print("Generating plots...")
-            # mpc_nn_system.plot_trajectories()
-            # mpc_nn_system.plot_errors()
+            mpc_nn_system.plot_trajectories()
+            mpc_nn_system.plot_errors()
             np.random.seed(37)
             x0 = np.random.uniform(-mpc_nn_system.test_bounds, mpc_nn_system.test_bounds)
             mpc_nn_system.close_loop_simulation(x0, Nsim=100)
             # mpc_nn_system.plot_costs()
-            # mpc_nn_system.plot_policy()
+            mpc_nn_system.plot_policy()
             mpc_nn_system.show_plots()
             
         except FileNotFoundError as e:
