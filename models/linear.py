@@ -240,6 +240,77 @@ class LinearSystem:
         
         return x_traj, u_traj
     
+    def generate_training_data(self):
+        """Generate training data by simulating the system from random initial states."""
+        Ncsim = 100
+        N = 10
+        alpha = 0.3
+        p_bound = 1.5 * alpha
+        v_bound = 1.0 * alpha 
+        theta_bound = 1.0 * alpha
+        omega_bound = 0.35 * alpha
+        np.random.seed(36)  # for reproducibility
+        
+        # For each simulation, store 
+        training_initial_states = []
+        training_first_control = []
+        training_full_controls = []
+        
+        for _ in range(Ncsim):
+            p0 = np.random.uniform(-p_bound, p_bound)
+            v0 = np.random.uniform(-v_bound, v_bound)
+            theta0 = np.random.uniform(-theta_bound, theta_bound)
+            omega0 = np.random.uniform(-omega_bound, omega_bound)
+            x0 = [theta0, p0, omega0, v0]
+            
+            # Simulate forward in time
+            u_traj = np.zeros((N, self.nu))
+            for k in range(N):
+                training_initial_states.append(x0)
+                # Get control input
+                u_k = self.solve_MPC(x0)  # Solve MPC to get control input for current state
+                training_first_control.append(u_k)
+                
+                # Ensure u_k is scalar
+                if hasattr(u_k, '__len__'):
+                    u_k = float(u_k[0])
+                else:
+                    u_k = float(u_k)
+                
+                u_traj[k, :] = u_k
+                
+                # Step forward
+                x_next = self.step(x0, [u_k])
+                x0 = np.array(x_next.full()).flatten()
+            
+                if self.solver.stats()['success']:
+                    self.good_initial_points += 1
+                else:
+                    # print(self.solver.stats()['return_status'])
+                    self.skip = True
+            training_full_controls.append(u_traj.flatten())
+            
+        # Save training data in two csv files so that we can use it later for supervised learning
+        from pathlib import Path
+        import pandas as pd
+        path = Path(__file__).parent / 'data'
+        print(path)
+        
+        df_1d = pd.DataFrame({
+            'initial_state': training_initial_states,
+            'first_control': training_first_control,
+        })
+        df_1d.to_csv(path / 'linear_system_training_data_1d.csv', index=False)
+        
+        df_Nd = pd.DataFrame({
+            # only keep the initial state for each simulation
+            'initial_state': training_initial_states[::N],  
+            'full_control_sequence': training_full_controls,
+        })
+        df_Nd.to_csv(path / 'linear_system_training_data_Nd.csv', index=False)
+        
+        print(f"Generated training data for {Ncsim} simulations")
+    
 if __name__ == "__main__":
     # Define A and B matrices
     A = [[1.0, 0.1, 0.0, 0.0],
@@ -253,23 +324,26 @@ if __name__ == "__main__":
     lin_sys = LinearSystem(A, B, dt=0.1)
     Ncsim = 200
     
+    # Generate training data for supervised learning
+    lin_sys.generate_training_data()
+    
     # Example usage: simulate with zero control input
-    alpha = 0.3
-    p_bound = 1.5 * alpha
-    v_bound = 1.0 * alpha 
-    theta_bound = 1.0 * alpha
-    omega_bound = 0.35 * alpha
-    np.random.seed(36)  # for reproducibility
-    for _ in range(Ncsim):
-        p0 = np.random.uniform(-p_bound, p_bound)
-        v0 = np.random.uniform(-v_bound, v_bound)
-        theta0 = np.random.uniform(-theta_bound, theta_bound)
-        omega0 = np.random.uniform(-omega_bound, omega_bound)
-        x0 = [theta0, p0, omega0, v0]
-        print (f"Initial state: {x0}")
-        control_policy = lambda x: np.array([0.0])  # zero control input
+    # alpha = 0.3
+    # p_bound = 1.5 * alpha
+    # v_bound = 1.0 * alpha 
+    # theta_bound = 1.0 * alpha
+    # omega_bound = 0.35 * alpha
+    # np.random.seed(36)  # for reproducibility
+    # for _ in range(Ncsim):
+    #     p0 = np.random.uniform(-p_bound, p_bound)
+    #     v0 = np.random.uniform(-v_bound, v_bound)
+    #     theta0 = np.random.uniform(-theta_bound, theta_bound)
+    #     omega0 = np.random.uniform(-omega_bound, omega_bound)
+    #     x0 = [theta0, p0, omega0, v0]
+    #     print (f"Initial state: {x0}")
+    #     control_policy = lambda x: np.array([0.0])  # zero control input
         
-        # Close-loop simulation with MPC control
-        lin_sys.close_loop_simulation(x0, plot_results=False)
+    #     # Close-loop simulation with MPC control
+    #     lin_sys.close_loop_simulation(x0, plot_results=False)
         
-    print(f"Number of good initial points: {lin_sys.good_initial_points} out of {Ncsim}")
+    # print(f"Number of good initial points: {lin_sys.good_initial_points} out of {Ncsim}")

@@ -1,3 +1,4 @@
+import csv
 from datetime import datetime
 import json
 from pathlib import Path
@@ -310,7 +311,7 @@ class LinearMPC_RNNComparison:
 			self.u_sim_batch.append(u_sim)
 			self.valid_indices.append(i)
 
-		self.plot_closed_loop_trajectories(Nsim)
+		# self.plot_closed_loop_trajectories(Nsim)
 
 	def print_results(self, threshold_rmse=0.01):
 		"""Print comparison results."""
@@ -549,6 +550,155 @@ class LinearMPC_RNNComparison:
 		plt.legend()
 		plt.suptitle(f"Trajectory Errors (Optimal - Learned) ({N_VALID} Valid Test Cases)")
 		plt.tight_layout(rect=[0, 0, 1, 0.96])
+  
+	def compare_closed_loop_simulations(self):
+		"""Compare closed-loop trajectories for optimal MPC and learned policy."""
+		# Load externally made simulations from csv file
+		csv_file = Path(__file__).parent.parent / "models" / "data" / "closed_loop_rollouts.csv"
+		if not csv_file.is_file():
+			raise FileNotFoundError(f"Closed-loop rollouts file not found: {csv_file}")
+		# The csv file is expected to have columns: sim_id, step, time, model, theta, p, omega, v, u
+		# Store data grouped by model and simulation id.
+		Ncsim = 20
+		N = 30
+
+		def parse_float(value):
+			if value is None:
+				return None
+			stripped = value.strip()
+			if not stripped:
+				return None
+			return float(stripped)
+
+		current_initial_state_saved = False
+		self.initial_states = []
+		x_a_batch = []
+		u_a_batch = []
+		x_b_batch = []
+		u_b_batch = []
+		x_rnn_batch = []
+		u_rnn_batch = []
+		x_a = []
+		x_b = []
+		u_a = []
+		u_b = []
+		x_rnn = []
+		u_rnn = []
+		with csv_file.open("r") as f:
+			reader = csv.DictReader(f)
+			for row in reader:
+				sim_id = int(row.get("sim_id"))
+				step = int(row.get("step"))
+				time = parse_float(row.get("time"))
+				model = (row.get("model") or "").strip() 
+      
+				theta = parse_float(row.get("theta"))
+				p = parse_float(row.get("p"))
+				omega = parse_float(row.get("omega"))
+				v = parse_float(row.get("v"))
+    
+				# Store the initial state for the first step of each simulation
+				if step == 0 and not current_initial_state_saved:
+					self.initial_states.append([theta, p, omega, v])
+					current_initial_state_saved = True
+				elif step != 0:
+					current_initial_state_saved = False
+
+				if model == "model_a":
+					x_a.append([theta, p, omega, v])
+					if step < N:
+						u_a.append(parse_float(row.get("u")))
+					else:
+						# If we have reached the end of the trajectory for model_a, store the data and reset for the next simulation
+						x_a_batch.append(x_a)
+						u_a_batch.append(u_a)
+						x_a = []
+						u_a = []
+					# Store the completed simulation data before moving to the next one
+				elif model == "model_b":
+					x_b.append([theta, p, omega, v])
+					if step < N:
+						u_b.append(parse_float(row.get("u")))
+					else:
+						# If we have reached the end of the trajectory for model_b, store the data and reset for the next simulation
+						x_b_batch.append(x_b)
+						u_b_batch.append(u_b)
+						x_b = []
+						u_b = []	
+				elif model == "model_rnn":
+					x_rnn.append([theta, p, omega, v])
+					if step < N:
+						u_rnn.append(parse_float(row.get("u")))
+					else:
+						x_rnn_batch.append(x_rnn)
+						u_rnn_batch.append(u_rnn)
+						x_rnn = []
+						u_rnn = []
+
+			if len(x_a_batch) != Ncsim or len(x_b_batch) != Ncsim or len(u_a_batch) != Ncsim or len(u_b_batch) != Ncsim:
+				print(
+					f"Warning: Expected {Ncsim} simulations for each model, but found "
+					f"{len(x_a_batch)} for model_a and {len(x_b_batch)} for model_b."
+				)
+			if x_rnn_batch and len(x_rnn_batch) != Ncsim:
+				print(
+					f"Warning: Expected {Ncsim} simulations for model_rnn, "
+					f"but found {len(x_rnn_batch)}."
+				)
+	
+		# Run closed-loop simulations for the learned policy using the initial states from the csv file
+		self.run_closed_loop_comparison(Nsim=N)
+		print(len(self.initial_states))
+		print(len(self.x_opt_batch), len(self.u_opt_batch), len(self.x_sim_batch), len(self.u_sim_batch))
+  
+		# Now we can compare the closed-loop trajectories from the csv file with the simulations
+		# Plotting the trajectories from the csv file
+		t = self.dt * np.arange(N + 1)
+		fig = plt.figure(figsize=(12, 8))
+		for s in range(self.NX):
+			ax = plt.subplot(self.NX + 1, 1, s + 1)
+			for i in range(min(Ncsim, len(x_a_batch))):
+				ax.plot(t, np.array(x_a_batch[i])[:, s], color="C0", alpha=0.3)
+			for i in range(min(Ncsim, len(x_b_batch))):
+				ax.plot(t, np.array(x_b_batch[i])[:, s], color="C1", linestyle="--", alpha=0.3)
+			for i in range(min(Ncsim, len(x_rnn_batch))):
+				ax.plot(t, np.array(x_rnn_batch[i])[:, s], color="C4", linestyle=":", alpha=0.4)
+			for i in range(len(self.x_opt_batch)):
+				ax.plot(t, self.x_opt_batch[i][s, :], color="C2", alpha=1.0)
+			for i in range(len(self.x_sim_batch)):
+				ax.plot(t, self.x_sim_batch[i][s, :], color="C3", linestyle="--", alpha=0.6)
+			ax.set_ylim(-self.x_bounds[s] * 1.2, self.x_bounds[s] * 1.2)
+			ax.set_xlabel("Time (s)")
+			ax.set_ylabel(f"x[{s}]")
+			ax.grid(True)
+			ax.plot([], [], color="C0", label="SL MLP (4x6x6x1)")
+			ax.plot([], [], color="C1", linestyle="--", label="SL MLP(4x20x20x10)")
+			ax.plot([], [], color="C4", linestyle=":", label="SL RNN (4x6x6x10)")
+			ax.plot([], [], color="C2", label="Optimal MPC")
+			ax.plot([], [], color="C3", linestyle="--", label="Learned Policy")
+			ax.legend()
+
+		ax_u = plt.subplot(self.NX + 1, 1, self.NX + 1)
+		for i in range(min(Ncsim, len(u_a_batch))):
+			ax_u.plot(t[:-1], np.array(u_a_batch[i]).flatten(), color="C0", alpha=0.3)
+		for i in range(min(Ncsim, len(u_b_batch))):
+			ax_u.plot(t[:-1], np.array(u_b_batch[i]).flatten(), color="C1", linestyle="--", alpha=0.3)
+		for i in range(min(Ncsim, len(u_rnn_batch))):
+			ax_u.plot(t[:-1], np.array(u_rnn_batch[i]).flatten(), color="C4", linestyle=":", alpha=0.4)
+		for i in range(len(self.u_opt_batch)):
+			ax_u.plot(t[:-1], self.u_opt_batch[i].flatten(), color="C2", alpha=1.0)
+		for i in range(len(self.u_sim_batch)):
+			ax_u.plot(t[:-1], self.u_sim_batch[i].flatten(), color="C3", linestyle="--", alpha=0.6)
+		ax_u.set_ylim(-self.u_bounds[0] * 1.2, self.u_bounds[0] * 1.2)
+		ax_u.set_xlabel("Time (s)")
+		ax_u.set_ylabel("u")
+		ax_u.grid(True)
+		ax_u.plot([], [], color="C0", label="SL MLP (4x6x6x1)")
+		ax_u.plot([], [], color="C1", linestyle="--", label="SL MLP(4x20x20x10)")
+		ax_u.plot([], [], color="C4", linestyle=":", label="SL RNN (4x6x6x10)")
+		ax_u.plot([], [], color="C2", label="Optimal MPC")
+		ax_u.plot([], [], color="C3", linestyle="--", label="Learned Policy")
+		ax_u.legend()
 
 
 if __name__ == "__main__":
@@ -569,9 +719,10 @@ if __name__ == "__main__":
 		u_bounds=[1.0],
 	)
 
-	comparison.generate_test_states(n_test=200, seed=36, alpha=0.3, plot_distribution=False)
+	# comparison.generate_test_states(n_test=20, seed=7, alpha=0.3, plot_distribution=False)
 	# comparison.run_open_loop_comparison()
 	# comparison.plot_controls()
-	comparison.plot_policy(state_index=2)
-	comparison.run_closed_loop_comparison(Nsim=20)
+	# comparison.plot_policy(state_index=2)
+	# comparison.run_closed_loop_comparison(Nsim=30)
+	comparison.compare_closed_loop_simulations()
 	comparison.show_plots()
