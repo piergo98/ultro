@@ -123,6 +123,16 @@ class InvertedPendulumMPC_RNNComparison:
         self.valid_indices = []
         
         print(f"Setup completed in {time.time() - start_time:.2f} seconds")
+        
+        # Generate test states
+        self.generate_test_states(n_test=200, seed=42, alpha=0.5)
+        
+        if self.initial_states is None:
+            raise ValueError("Generate test states first using generate_test_states()")
+        
+        if not hasattr(self, 'params_init_vec'):
+            self.load_learned_params()
+            input("Press Enter to start testing...")
     
     def _setup_network(self):
         """Set up the RNN approximator."""
@@ -157,7 +167,7 @@ class InvertedPendulumMPC_RNNComparison:
         output_vec = ca.reshape(output_seq, self.NU * self.N, 1)
         self.net_fcn = ca.Function('net_fcn', [x, self.params_flattened], [output_vec])
     
-    def generate_test_states(self, n_test=20, seed=42):
+    def generate_test_states(self, n_test=20, seed=42, alpha=0.5):
         """Generate random initial states for testing.
         
         Parameters
@@ -166,16 +176,29 @@ class InvertedPendulumMPC_RNNComparison:
             Number of test cases.
         seed : int
             Random seed for reproducibility.
+        alpha : float
+            Scaling factor to ensure test states are within training distribution.
         """
+        self.initial_states = np.zeros((self.NX, n_test))
+        extreme_x0 = self.inverted_pendulum.solve_extreme_x0(N=self.N, plot_results=False)
+        # Consider also the mirrored initial states to get more coverage
+        extreme_x0 += [np.array([-x[0], -x[1]]) for x in extreme_x0]
+        self.initial_states[:, :len(extreme_x0)] = np.array(extreme_x0).T
+        # Generate the rest of the initial states randomly
+        num_random = n_test - len(extreme_x0)
         np.random.seed(seed)
-        alpha = 0.5  # scaling factor to ensure test states are within training distribution
         self.theta_test_bound = self.inverted_pendulum.theta_bound * alpha
         self.omega_test_bound = self.inverted_pendulum.omega_bound * alpha
         
-        self.initial_states = np.zeros((n_test, self.NX))
-        self.initial_states[:, 0] = np.random.uniform(-self.theta_test_bound, self.theta_test_bound, n_test)
-        self.initial_states[:, 1] = np.random.uniform(-self.omega_test_bound, self.omega_test_bound, n_test)
-        
+        X_random = np.random.uniform(
+            low=np.array([-self.theta_test_bound, -self.omega_test_bound]).reshape(-1, 1),
+            high=np.array([self.theta_test_bound, self.omega_test_bound]).reshape(-1, 1),
+            size=(self.NX, num_random)
+        )
+        self.initial_states = np.hstack((self.initial_states, X_random))
+        # self.initial_states[:, 0] = np.random.uniform(-self.theta_test_bound, self.theta_test_bound, n_test)
+        # self.initial_states[:, 1] = np.random.uniform(-self.omega_test_bound, self.omega_test_bound, n_test)
+        # print(self.initial_states[:, :5])  # Print first 5 initial states for verification
         print(f"Generated {n_test} uniformly sampled initial states")
         
     def find_latest_params(self, model_dir, model_name, extension="yaml"):
@@ -209,13 +232,13 @@ class InvertedPendulumMPC_RNNComparison:
         """Load parameters for the learned policy."""
         model_name = get_model_name(self.hidden_sizes)
         params_file = self.find_latest_params(self.model_dir, model_name, "yaml")
-        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_inverted_pendulum/optimal_params_ip_cc_20_2026-03-24_17-31-49.yaml"
+        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_inverted_pendulum/optimal_params_ip_cc_6x6_2026-03-27_18-42-41.yaml"
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         self.params_init_vec = load_params(params_file)
         print(f"Loaded parameters from {params_file}")
     
-    def run_comparison(self, wait_for_input=True):
+    def run_open_loop_comparison(self):
         """Run the comparison between optimal MPC and learned policy.
         
         Parameters
@@ -223,14 +246,6 @@ class InvertedPendulumMPC_RNNComparison:
         wait_for_input : bool
             Whether to wait for user input before starting.
         """
-        if self.initial_states is None:
-            raise ValueError("Generate test states first using generate_test_states()")
-        
-        if not hasattr(self, 'params_init_vec'):
-            self.load_learned_params()
-        
-        if wait_for_input:
-            input("Press Enter to start testing...")
         
         N_TEST = len(self.initial_states)
         print(f"Testing {N_TEST} initial states...")
@@ -244,14 +259,17 @@ class InvertedPendulumMPC_RNNComparison:
         self.valid_indices = []
         
         # Solve MPC and simulate learned policy for each initial state
-        for i, x0 in enumerate(self.initial_states):
-            x0_list = x0.tolist()
+        for i in range(N_TEST):
+            x0 = self.initial_states[:, i]
             
             # Solve the MPC NLP
             u_opt = self.inverted_pendulum.solve_MPC(x0, ret_seq=True)
             
             # # Extract the optimal solution
             # w_opt = solution['x'].full().flatten()
+            if u_opt is None:
+                print(f"Test case {i} failed to solve MPC. Skipping this case.")
+                continue
             
             # # Extract optimal state and control trajectories
             # _, u_opt = self.extract_traj(w_opt)
@@ -304,8 +322,8 @@ class InvertedPendulumMPC_RNNComparison:
         self.valid_indices = []
         
         # Run closed-loop simulation for each initial state
-        for i, x0 in enumerate(self.initial_states):
-            x0_list = x0.tolist()
+        for i in range(N_TEST):
+            x0 = self.initial_states[:, i]
 
             # Simulate the learned policy in closed loop for the same initial state
             x_sim = np.zeros((self.NX, Nsim + 1))
@@ -474,8 +492,8 @@ class InvertedPendulumMPC_RNNComparison:
         
         # Control over time
         for i in range(N_VALID):
-            plt.step(t_u, self.u_opt_batch[i].flatten(), where='post', alpha=0.3, color='C2')
-            plt.step(t_u, self.u_sim_batch[i].flatten(), where='post', alpha=0.3, color='C3')
+            plt.plot(t_u, self.u_opt_batch[i].flatten(), alpha=0.3, color='C2')
+            plt.plot(t_u, self.u_sim_batch[i].flatten(), alpha=0.3, color='C3')
         plt.step([], [], where='post', label=f'Optimal (Avg RMSE={avg_rmse_u:.3f})', color='C2')
         plt.step([], [], where='post', label='Learned', color='C3')
         plt.xlabel('Time Step')
@@ -696,25 +714,22 @@ class InvertedPendulumMPC_RNNComparison:
 if __name__ == "__main__":
     # Create comparison object
     comparison = InvertedPendulumMPC_RNNComparison(
-        hidden_sizes=[3, 3],
+        hidden_sizes=[6, 6],
         horizon=10,
         complementarity=True
     )
     
-    # Generate test states
-    comparison.generate_test_states(n_test=200, seed=36)
-    
     # Run comparison
-    comparison.run_comparison(wait_for_input=True)
+    comparison.run_open_loop_comparison()
     
     # Print results
     # comparison.print_results(threshold_rmse=0.01)
     
     # Generate plots
-    # comparison.plot_controls()
+    comparison.plot_controls()
     comparison.plot_policy()
     # # comparison.plot_policy_3d()
     # comparison.plot_errors()
     # # comparison.plot_costs()
-    # comparison.run_closed_loop_comparison(Nsim=30)
+    comparison.run_closed_loop_comparison(Nsim=20)
     comparison.show_plots()
