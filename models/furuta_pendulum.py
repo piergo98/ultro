@@ -33,6 +33,7 @@ class FurutaPendulum:
         self.dynamics = self.dynamics_func()
         self.step = self.step_func()
         self.lin_dyn = self.linearized_dynamics()
+        self.init_cost, self.stage_cost, self.terminal_cost = self.cost_func()
         
         N = 10  # MPC horizon
         self.define_simple_MPC_control(N, seek_x0=False)  # Define the MPC controller
@@ -105,21 +106,15 @@ class FurutaPendulum:
         A_sym = ca.jacobian(xdot, x)
         B_sym = ca.jacobian(xdot, u)
         return ca.Function('linearized_dynamics', [x, u], [A_sym, B_sym])
-
-    def define_simple_MPC_control(self, N, seek_x0=False):
-        ''' A simple MPC controller that tries to stabilize the pole at the upright position. '''
+    
+    def cost_func(self):
+        ''' Define the cost function for the MPC controller. '''
         # Define optimization variables and parameters
         x = ca.SX.sym('x', 4)  # state variable
         u = ca.SX.sym('u', 1)  # control variable
         x0 = ca.SX.sym('x0', 4)  # initial state parameter
-        X = ca.SX.sym('X', 4, N+1)  # state trajectory
-        U = ca.SX.sym('U', 1, N)    # control trajectory
-        decvar = ca.veccat(X[:,0], ca.vertcat(U, X[:,1:], ))
-        # to extract trajectories in nice shape from decvar
-        self.extract_traj = ca.Function("extract_traj", [decvar], [X, U])
-        self.traj_to_vec = ca.Function("traj_to_vec", [X, U], [decvar])
         
-        # Define cost function (quadratic cost on state deviation and control effort)
+        # Define the cost matrices and reference trajectories
         y_ref = ca.DM([np.pi, 0.0, np.pi, 0.0, 0.0])  # desired state and control
         y_ref_e = ca.DM([np.pi, 0.0, np.pi, 0.0])  # desired terminal state
         W_0 = 1e-2*ca.DM.eye(4)  # initial state cost weight
@@ -127,21 +122,9 @@ class FurutaPendulum:
         W_u = ca.diag(ca.DM([0.01]))  # control cost weight
         W = ca.blockcat([[W_x, np.zeros((4, 1))], [np.zeros((1, 4)), W_u]])  # combined state-control cost weight
         W_e = W_x  # terminal state cost weight
-        # A, B = self.lin_dyn(xr, ca.DM([0]))  # linearized dynamics around the upright position
-        # E = solve_continuous_are(A.full(), B.full(), Q.full(), R.full())
-        
-        self.theta_1_bound = ca.inf
-        self.omega_1_bound = ca.inf
-        self.theta_2_bound = ca.inf
-        self.omega_2_bound = ca.inf
-        
-        self.u_bound = 10.0
-        
-        x_next = self.step(x, u)
-        F = ca.Function('F', [x, u], [x_next])
         
         # Cost function
-        # Nonlinear output maps from your acados model
+        # Nonlinear output maps
         y_expr = ca.vertcat(
             ca.pi * (1 + ca.cos(x[0] / 2)),
             x[1],
@@ -174,6 +157,31 @@ class FurutaPendulum:
         stage_cost = ca.Function('stage_cost', [x, u], [cost_path])
         terminal_cost = ca.Function('terminal_cost', [x], [cost_terminal])
         
+        return init_cost, stage_cost, terminal_cost
+
+    def define_simple_MPC_control(self, N, seek_x0=False):
+        ''' A simple MPC controller that tries to stabilize the pole at the upright position. '''
+        # Define optimization variables and parameters
+        x = ca.SX.sym('x', 4)  # state variable
+        u = ca.SX.sym('u', 1)  # control variable
+        x0 = ca.SX.sym('x0', 4)  # initial state parameter
+        X = ca.SX.sym('X', 4, N+1)  # state trajectory
+        U = ca.SX.sym('U', 1, N)    # control trajectory
+        decvar = ca.veccat(X[:,0], ca.vertcat(U, X[:,1:], ))
+        # to extract trajectories in nice shape from decvar
+        self.extract_traj = ca.Function("extract_traj", [decvar], [X, U])
+        self.traj_to_vec = ca.Function("traj_to_vec", [X, U], [decvar])
+        
+        self.theta_1_bound = ca.inf
+        self.omega_1_bound = ca.inf
+        self.theta_2_bound = ca.inf
+        self.omega_2_bound = ca.inf
+        
+        self.u_bound = 10.0
+        
+        x_next = self.step(x, u)
+        F = ca.Function('F', [x, u], [x_next])
+        
         # Create an NLP to minimize the cost over a horizon
         w = []      # decision variables
         self.lbw = []    # lower bounds on decision variables
@@ -197,7 +205,7 @@ class FurutaPendulum:
             self.w0 += [0.0 for _ in range(4)]
 
         # Initial cost
-        J += init_cost(Xk, x0)
+        J += self.init_cost(Xk, x0)
         for k in range(N):
             uk = ca.SX.sym('u_' + str(k), 1)
             w += [uk]
@@ -207,7 +215,7 @@ class FurutaPendulum:
 
             Xk_next = F(Xk, uk)
             
-            J += stage_cost(Xk, uk)  # stage cost
+            J += self.stage_cost(Xk, uk)  # stage cost
             
             Xk = ca.SX.sym('X_' + str(k+1), 4)
             w += [Xk]
@@ -219,7 +227,7 @@ class FurutaPendulum:
             self.lbg += [0.0 for _ in range(4)]
             self.ubg += [0.0 for _ in range(4)]
             
-        J += terminal_cost(Xk)  # terminal cost
+        J += self.terminal_cost(Xk)  # terminal cost
         # Create an NLP solver instance
         nlp_prob = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': x0}
         opts = {
