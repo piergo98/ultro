@@ -687,20 +687,17 @@ if __name__ == "__main__":
     theta_2_bound = np.pi
     omega_2_bound = 1.0
     theta1_0 = np.random.uniform(-theta_1_bound, theta_1_bound)
-    omega1_0 = np.random.uniform(-omega_1_bound, omega_1_bound)
-    theta2_0 = np.random.uniform(-theta_2_bound, theta_2_bound)
-    omega2_0 = np.random.uniform(-omega_2_bound, omega_2_bound)
     # x0 = [theta1_0, omega1_0, theta2_0, omega2_0]
-    x0 = [0.1, 0, 0.0, 0]
+    x0 = [theta1_0, 0, 0.0, 0]
     # print (f"Initial state: {x0_dump}")
     # N = 10  # number of simulation steps
     # control_policy = lambda x: np.array([0.0])  # zero control input
     
     # X0 = inv_pend.solve_extreme_x0(N, plot_results=False)
-    # print(x0)
-    # fur_pend.close_loop_simulation(x0, Nsim=100)
+    print(x0)
+    fur_pend.close_loop_simulation(x0, Nsim=30)
     # Animate
     # x0 = [0.0, 0.0, np.pi/6, 0.0]  # Small initial angle
-    x_traj, u_traj, anim = fur_pend.animate(
-        x0, control_policy=None)  # 50ms between frames
+    # x_traj, u_traj, anim = fur_pend.animate(
+    #     x0, control_policy=None)  # 50ms between frames
         # save_path='inv_pend.gif'  # Optional: save to file
