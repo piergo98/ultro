@@ -2,12 +2,12 @@ import casadi as ca
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.patches import Rectangle
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.linalg import solve_discrete_are, solve_continuous_are
 
 
 class FurutaPendulum:
-    def __init__(self, dt=0.01, sym_type='SX'):
+    def __init__(self, dt=0.02, sym_type='SX'):
         self.dt = dt
         self.sym_type = sym_type
 
@@ -120,24 +120,59 @@ class FurutaPendulum:
         self.traj_to_vec = ca.Function("traj_to_vec", [X, U], [decvar])
         
         # Define cost function (quadratic cost on state deviation and control effort)
-        xr = ca.DM([0.0, 0.0, 0.0, 0.0])  # desired state (upright position)
-        Q = ca.diag(ca.DM([10, 5, 100, 1]))  # state cost weights
-        R = ca.diag(ca.DM([0.01]))  # control cost weight
-        A, B = self.lin_dyn(xr, ca.DM([0]))  # linearized dynamics around the upright position
-        E = solve_continuous_are(A.full(), B.full(), Q.full(), R.full())
+        y_ref = ca.DM([np.pi, 0.0, np.pi, 0.0, 0.0])  # desired state and control
+        y_ref_e = ca.DM([np.pi, 0.0, np.pi, 0.0])  # desired terminal state
+        W_0 = 1e-2*ca.DM.eye(4)  # initial state cost weight
+        W_x = ca.diag(ca.DM([20, 5, 100, 1]))  # state cost weights
+        W_u = ca.diag(ca.DM([0.01]))  # control cost weight
+        W = ca.blockcat([[W_x, np.zeros((4, 1))], [np.zeros((1, 4)), W_u]])  # combined state-control cost weight
+        W_e = W_x  # terminal state cost weight
+        # A, B = self.lin_dyn(xr, ca.DM([0]))  # linearized dynamics around the upright position
+        # E = solve_continuous_are(A.full(), B.full(), Q.full(), R.full())
         
         self.theta_1_bound = ca.inf
-        self.omega_1_bound = 20.0
+        self.omega_1_bound = ca.inf
         self.theta_2_bound = ca.inf
-        self.omega_2_bound = 20.0
+        self.omega_2_bound = ca.inf
         
         self.u_bound = 10.0
         
         x_next = self.step(x, u)
-        l = (x - xr).T @ Q @ (x - xr) + u.T @ R @ u 
+        F = ca.Function('F', [x, u], [x_next])
+        
+        # Cost function
+        # Nonlinear output maps from your acados model
+        y_expr = ca.vertcat(
+            ca.pi * (1 + ca.cos(x[0] / 2)),
+            x[1],
+            ca.pi * (1 + ca.cos(x[2] / 2)),
+            x[3],
+            u
+        )
+
+        y_expr_e = ca.vertcat(
+            ca.pi * (1 + ca.cos(x[0] / 2)),
+            x[1],
+            ca.pi * (1 + ca.cos(x[2] / 2)),
+            x[3]
+        )
+
+        # Initial cost: LINEAR_LS with Vx_0 = I, Vu_0 = 0, yref_0 = x0
+        e0 = x - x0
+        cost_0 = 0.5 * ca.mtimes([e0.T, W_0, e0])
+
+        # Path cost: NONLINEAR_LS
+        ep = y_expr - y_ref
+        cost_path = 0.5 * ca.mtimes([ep.T, W, ep])
+
+        # Terminal cost: NONLINEAR_LS
+        ee = y_expr_e - y_ref_e
+        cost_terminal = 0.5 * ca.mtimes([ee.T, W_e, ee])
         
         # Create a CasADi function for the stage cost
-        F = ca.Function('F', [x, u], [x_next, l])
+        init_cost = ca.Function('init_cost', [x, x0], [cost_0])
+        stage_cost = ca.Function('stage_cost', [x, u], [cost_path])
+        terminal_cost = ca.Function('terminal_cost', [x], [cost_terminal])
         
         # Create an NLP to minimize the cost over a horizon
         w = []      # decision variables
@@ -161,19 +196,18 @@ class FurutaPendulum:
             # Randowmize initial state in the bounds
             self.w0 += [0.0 for _ in range(4)]
 
+        # Initial cost
+        J += init_cost(Xk, x0)
         for k in range(N):
             uk = ca.SX.sym('u_' + str(k), 1)
             w += [uk]
-            if seek_x0 and k == 0:
-                self.lbw += [-self.u_bound]  # control limits
-                self.ubw += [self.u_bound]
-                self.w0 += [0.0]     # initial guess
-            else:
-                self.lbw += [-self.u_bound]  # control limits
-                self.ubw += [self.u_bound]
-                self.w0 += [0.0]     # initial guess
+            self.lbw += [-self.u_bound]  # control limits
+            self.ubw += [self.u_bound]
+            self.w0 += [0.0]     # initial guess
 
-            Xk_next, l_k = F(Xk, uk)
+            Xk_next = F(Xk, uk)
+            
+            J += stage_cost(Xk, uk)  # stage cost
             
             Xk = ca.SX.sym('X_' + str(k+1), 4)
             w += [Xk]
@@ -185,8 +219,7 @@ class FurutaPendulum:
             self.lbg += [0.0 for _ in range(4)]
             self.ubg += [0.0 for _ in range(4)]
             
-            J += l_k  # accumulate cost
-        J += (Xk - xr).T @ ca.DM(E) @ (Xk - xr)  # terminal cost
+        J += terminal_cost(Xk)  # terminal cost
         # Create an NLP solver instance
         nlp_prob = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': x0}
         opts = {
@@ -332,7 +365,9 @@ class FurutaPendulum:
         # Return the first state
         return x_opt[:, 0].full().flatten()  # return the first state in the optimal trajectory
 
-    def animate(self, x0, Nsim=120, control_policy=None, interval=40, repeat=False, save_path=None, fps=25, show=True):
+    def animate(self, x0, Nsim=120, control_policy=None, interval=40, repeat=False,
+        save_path=None, fps=25, show=True, show_desired=True, desired_state=None,
+        show_motion_plane=True):
         """Run a closed-loop simulation and animate the Furuta pendulum motion.
 
         Parameters
@@ -353,6 +388,13 @@ class FurutaPendulum:
             Output frame rate when saving animation.
         show : bool, optional
             Whether to display the animation window.
+        show_desired : bool, optional
+            Whether to overlay the desired configuration as a translucent target pose.
+        desired_state : array_like or None, optional
+            Desired state [theta1, omega1, theta2, omega2]. If None, defaults to
+            [pi, 0, pi, 0].
+        show_motion_plane : bool, optional
+            Whether to show the rotating vertical plane in which the pendulum moves.
 
         Returns
         -------
@@ -372,78 +414,149 @@ class FurutaPendulum:
 
         theta1 = x_traj[:, 0]
         theta2 = x_traj[:, 2]
-
-        # Planar coordinates for top view (arm in x-y plane).
+        # 3D coordinates.
         arm_x = self.L1 * np.cos(theta1)
         arm_y = self.L1 * np.sin(theta1)
+        arm_z = np.zeros_like(arm_x)
 
-        # Side-view projection along radial arm direction.
-        pend_r = self.L1 + self.l2 * np.sin(theta2)
-        pend_z = -self.l2 * np.cos(theta2)
+        bob_x = (self.L1 + self.l2 * np.sin(theta2)) * np.cos(theta1)
+        bob_y = (self.L1 + self.l2 * np.sin(theta2)) * np.sin(theta1)
+        bob_z = -self.l2 * np.cos(theta2)
 
-        r_lim = 1.25 * (self.L1 + self.l2)
-        z_lim = 1.25 * self.l2
+        lim = 1.25 * (self.L1 + self.l2)
 
-        fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+        if desired_state is None:
+            desired_state = np.array([np.pi, 0.0, np.pi, 0.0], dtype=float)
+        desired_state = np.array(desired_state, dtype=float).flatten()
+        if desired_state.shape[0] != 4:
+            raise ValueError("desired_state must be an array-like with 4 elements.")
 
-        # Top view setup.
-        ax_top = axes[0]
-        ax_top.set_title("Top View (x-y)")
-        ax_top.set_aspect("equal")
-        ax_top.set_xlim(-r_lim, r_lim)
-        ax_top.set_ylim(-r_lim, r_lim)
-        ax_top.grid(True, alpha=0.3)
-        ax_top.set_xlabel("x (m)")
-        ax_top.set_ylabel("y (m)")
-        base_patch = Rectangle((-0.01, -0.01), 0.02, 0.02, color="k", alpha=0.8)
-        ax_top.add_patch(base_patch)
-        top_arm_line, = ax_top.plot([], [], "tab:blue", lw=3)
-        top_tip, = ax_top.plot([], [], "o", color="tab:blue", ms=6)
+        desired_theta1 = desired_state[0]
+        desired_theta2 = desired_state[2]
+        desired_arm_x = self.L1 * np.cos(desired_theta1)
+        desired_arm_y = self.L1 * np.sin(desired_theta1)
+        desired_arm_z = 0.0
+        desired_bob_x = (self.L1 + self.l2 * np.sin(desired_theta2)) * np.cos(desired_theta1)
+        desired_bob_y = (self.L1 + self.l2 * np.sin(desired_theta2)) * np.sin(desired_theta1)
+        desired_bob_z = -self.l2 * np.cos(desired_theta2)
 
-        # Side view setup.
-        ax_side = axes[1]
-        ax_side.set_title("Side View (r-z)")
-        ax_side.set_aspect("equal")
-        ax_side.set_xlim(-0.2 * self.L1, r_lim)
-        ax_side.set_ylim(-z_lim, 0.25 * z_lim)
-        ax_side.grid(True, alpha=0.3)
-        ax_side.set_xlabel("radial distance r (m)")
-        ax_side.set_ylabel("z (m)")
-        side_arm_line, = ax_side.plot([], [], "tab:orange", lw=3)
-        side_pend_line, = ax_side.plot([], [], "tab:red", lw=3)
-        side_bob, = ax_side.plot([], [], "o", color="tab:red", ms=7)
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_title("Furuta Pendulum 3D Animation")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("y (m)")
+        ax.set_zlabel("z (m)")
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_zlim(-lim, 0.5 * lim)
+        ax.set_box_aspect((1.0, 1.0, 0.8))
+        ax.view_init(elev=24, azim=38)
+        ax.grid(True, alpha=0.3)
 
-        time_text = ax_top.text(
+        def _plane_vertices(theta):
+            e_r = np.array([np.cos(theta), np.sin(theta), 0.0])
+            e_z = np.array([0.0, 0.0, 1.0])
+            p_arm = self.L1 * e_r
+            r_half = 1.05 * self.l2
+            z_half = 1.05 * self.l2
+            v1 = p_arm - r_half * e_r - z_half * e_z
+            v2 = p_arm + r_half * e_r - z_half * e_z
+            v3 = p_arm + r_half * e_r + z_half * e_z
+            v4 = p_arm - r_half * e_r + z_half * e_z
+            return [v1, v2, v3, v4]
+
+        # Base marker at the rotary joint.
+        base_marker, = ax.plot([0.0], [0.0], [0.0], "o", color="k", ms=6)
+        desired_arm_line = None
+        desired_pend_line = None
+        desired_bob_marker = None
+        if show_desired:
+            desired_arm_line, = ax.plot(
+                [0.0, desired_arm_x],
+                [0.0, desired_arm_y],
+                [0.0, desired_arm_z],
+                "--",
+                color="tab:green",
+                lw=2.2,
+                alpha=0.35,
+            )
+            desired_pend_line, = ax.plot(
+                [desired_arm_x, desired_bob_x],
+                [desired_arm_y, desired_bob_y],
+                [desired_arm_z, desired_bob_z],
+                "--",
+                color="tab:green",
+                lw=2.2,
+                alpha=0.35,
+            )
+            desired_bob_marker, = ax.plot(
+                [desired_bob_x],
+                [desired_bob_y],
+                [desired_bob_z],
+                "o",
+                color="tab:green",
+                ms=6,
+                alpha=0.35,
+            )
+        arm_line, = ax.plot([], [], [], color="tab:blue", lw=3)
+        pend_line, = ax.plot([], [], [], color="tab:red", lw=3)
+        bob_marker, = ax.plot([], [], [], "o", color="tab:red", ms=7)
+        trace_line, = ax.plot([], [], [], color="tab:gray", lw=1.2, alpha=0.6)
+        motion_plane = None
+        if show_motion_plane:
+            motion_plane = Poly3DCollection(
+                [_plane_vertices(theta1[0])],
+                facecolors="tab:blue",
+                edgecolors="tab:blue",
+                linewidths=0.7,
+                linestyles=":",
+                alpha=0.10,
+            )
+            ax.add_collection3d(motion_plane)
+
+        desired_label = " (with desired pose)" if show_desired else ""
+        time_text = ax.text2D(
             0.03,
             0.95,
-            "",
-            transform=ax_top.transAxes,
+            f"Target{desired_label}",
+            transform=ax.transAxes,
             va="top",
             ha="left",
-            bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
         )
 
         def _init():
-            top_arm_line.set_data([], [])
-            top_tip.set_data([], [])
-            side_arm_line.set_data([], [])
-            side_pend_line.set_data([], [])
-            side_bob.set_data([], [])
-            time_text.set_text("")
-            return top_arm_line, top_tip, side_arm_line, side_pend_line, side_bob, time_text
+            arm_line.set_data([], [])
+            arm_line.set_3d_properties([])
+            pend_line.set_data([], [])
+            pend_line.set_3d_properties([])
+            bob_marker.set_data([], [])
+            bob_marker.set_3d_properties([])
+            trace_line.set_data([], [])
+            trace_line.set_3d_properties([])
+            if motion_plane is not None:
+                motion_plane.set_verts([_plane_vertices(theta1[0])])
+            time_text.set_text(f"t = 0.00 s{desired_label}")
+            return base_marker, arm_line, pend_line, bob_marker, trace_line, time_text
 
         def _update(i):
-            # Top view arm segment.
-            top_arm_line.set_data([0.0, arm_x[i]], [0.0, arm_y[i]])
-            top_tip.set_data([arm_x[i]], [arm_y[i]])
+            arm_line.set_data([0.0, arm_x[i]], [0.0, arm_y[i]])
+            arm_line.set_3d_properties([0.0, arm_z[i]])
 
-            # Side view: horizontal arm and pendulum projection.
-            side_arm_line.set_data([0.0, self.L1], [0.0, 0.0])
-            side_pend_line.set_data([self.L1, pend_r[i]], [0.0, pend_z[i]])
-            side_bob.set_data([pend_r[i]], [pend_z[i]])
+            pend_line.set_data([arm_x[i], bob_x[i]], [arm_y[i], bob_y[i]])
+            pend_line.set_3d_properties([arm_z[i], bob_z[i]])
 
-            time_text.set_text(f"t = {i * self.dt:.2f} s")
-            return top_arm_line, top_tip, side_arm_line, side_pend_line, side_bob, time_text
+            bob_marker.set_data([bob_x[i]], [bob_y[i]])
+            bob_marker.set_3d_properties([bob_z[i]])
+
+            trace_line.set_data(bob_x[: i + 1], bob_y[: i + 1])
+            trace_line.set_3d_properties(bob_z[: i + 1])
+
+            if motion_plane is not None:
+                motion_plane.set_verts([_plane_vertices(theta1[i])])
+
+            time_text.set_text(f"t = {i * self.dt:.2f} s{desired_label}")
+            return base_marker, arm_line, pend_line, bob_marker, trace_line, time_text
 
         anim = FuncAnimation(
             fig,
@@ -451,7 +564,7 @@ class FurutaPendulum:
             frames=x_traj.shape[0],
             init_func=_init,
             interval=interval,
-            blit=True,
+            blit=False,
             repeat=repeat,
         )
 
@@ -566,7 +679,7 @@ class FurutaPendulum:
     
 if __name__ == "__main__":
     # Create cart-pole environment
-    fur_pend = FurutaPendulum(dt=0.1, sym_type='SX')
+    fur_pend = FurutaPendulum(dt=0.05, sym_type='SX')
     
     # Example usage: simulate with zero control input
     theta_1_bound = np.pi
@@ -577,16 +690,17 @@ if __name__ == "__main__":
     omega1_0 = np.random.uniform(-omega_1_bound, omega_1_bound)
     theta2_0 = np.random.uniform(-theta_2_bound, theta_2_bound)
     omega2_0 = np.random.uniform(-omega_2_bound, omega_2_bound)
-    x0 = [theta1_0, omega1_0, theta2_0, omega2_0]
+    # x0 = [theta1_0, omega1_0, theta2_0, omega2_0]
+    x0 = [0.1, 0, 0.0, 0]
     # print (f"Initial state: {x0_dump}")
-    N = 10  # number of simulation steps
-    control_policy = lambda x: np.array([0.0])  # zero control input
+    # N = 10  # number of simulation steps
+    # control_policy = lambda x: np.array([0.0])  # zero control input
     
     # X0 = inv_pend.solve_extreme_x0(N, plot_results=False)
-    print(x0)
-    fur_pend.close_loop_simulation(x0, Nsim=20)
+    # print(x0)
+    # fur_pend.close_loop_simulation(x0, Nsim=100)
     # Animate
     # x0 = [0.0, 0.0, np.pi/6, 0.0]  # Small initial angle
-    # x_traj, u_traj, anim = fur_pend.animate(
-    #     x0, control_policy=None)  # 50ms between frames
+    x_traj, u_traj, anim = fur_pend.animate(
+        x0, control_policy=None)  # 50ms between frames
         # save_path='inv_pend.gif'  # Optional: save to file
