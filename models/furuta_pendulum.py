@@ -35,7 +35,7 @@ class FurutaPendulum:
         self.lin_dyn = self.linearized_dynamics()
         self.init_cost, self.stage_cost, self.terminal_cost = self.cost_func()
         
-        N = 10  # MPC horizon
+        N = 12  # MPC horizon
         self.define_simple_MPC_control(N, seek_x0=False)  # Define the MPC controller
 
     def _mass_matrix(self, theta2):
@@ -118,25 +118,25 @@ class FurutaPendulum:
         y_ref = ca.DM([np.pi, 0.0, np.pi, 0.0, 0.0])  # desired state and control
         y_ref_e = ca.DM([np.pi, 0.0, np.pi, 0.0])  # desired terminal state
         W_0 = 1e-2*ca.DM.eye(4)  # initial state cost weight
-        W_x = ca.diag(ca.DM([20, 5, 100, 1]))  # state cost weights
-        W_u = ca.diag(ca.DM([0.01]))  # control cost weight
+        W_x = ca.diag(ca.DM([60, 1, 600, 1]))  # state cost weights
+        W_u = ca.diag(ca.DM([100]))  # control cost weight
         W = ca.blockcat([[W_x, np.zeros((4, 1))], [np.zeros((1, 4)), W_u]])  # combined state-control cost weight
         W_e = W_x  # terminal state cost weight
         
         # Cost function
         # Nonlinear output maps
         y_expr = ca.vertcat(
-            ca.pi * (1 + ca.cos(x[0] / 2)),
+            x[0],
             x[1],
-            ca.pi * (1 + ca.cos(x[2] / 2)),
+            x[2],
             x[3],
             u
         )
 
         y_expr_e = ca.vertcat(
-            ca.pi * (1 + ca.cos(x[0] / 2)),
+            x[0],
             x[1],
-            ca.pi * (1 + ca.cos(x[2] / 2)),
+            x[2],
             x[3]
         )
 
@@ -232,13 +232,13 @@ class FurutaPendulum:
         nlp_prob = {'f': J, 'x': ca.vertcat(*w), 'g': ca.vertcat(*g), 'p': x0}
         opts = {
             "expand": True,
-            "print_time": False,
+            "print_time": True,
             "ipopt": {
-                "print_level": 0,
+                "print_level": 5,
                 "max_iter": 5000,
                 "tol": 1e-8,
-                "hsllib": "/home/pietro/ThirdParty-HSL/coinhsl-2024.05.15/install/lib/x86_64-linux-gnu/libcoinhsl.so",
-                "linear_solver": "ma27",
+                # "hsllib": "/home/pietro/ThirdParty-HSL/coinhsl-2024.05.15/install/lib/x86_64-linux-gnu/libcoinhsl.so",
+                # "linear_solver": "ma27",
             }
         }
         self.solver = ca.nlpsol("solver", "ipopt", nlp_prob, opts)
@@ -256,7 +256,7 @@ class FurutaPendulum:
         
         x_opt, u_opt = self.extract_traj(sol['x'])
         if not self.solver.stats()['success']:
-            print("stocazzo")
+            # print(self.solver.stats()['return_status'])
             return None
         # Return the optimal control sequence
         
@@ -307,68 +307,68 @@ class FurutaPendulum:
         
         return u_opt.full().flatten()[0]  # return only the first control input
     
-    def solve_MPC_for_initial_states(self, x0, plot_results=False):
-        ''' Solve the MPC problem for a given initial state x0. '''
-        sol = self.solver(
-            x0=self.w0, 
-            lbx=self.lbw, 
-            ubx=self.ubw, 
-            lbg=self.lbg, 
-            ubg=self.ubg, 
-            p=x0
-        )
+    # def solve_MPC_for_initial_states(self, x0, plot_results=False):
+    #     ''' Solve the MPC problem for a given initial state x0. '''
+    #     sol = self.solver(
+    #         x0=self.w0, 
+    #         lbx=self.lbw, 
+    #         ubx=self.ubw, 
+    #         lbg=self.lbg, 
+    #         ubg=self.ubg, 
+    #         p=x0
+    #     )
         
-        x_opt, u_opt = self.extract_traj(sol['x'])
-        if not self.solver.stats()['success']:
-            raise RuntimeError("MPC solver failed to find a solution.")
-        # Return the optimal control sequence
+    #     x_opt, u_opt = self.extract_traj(sol['x'])
+    #     if not self.solver.stats()['success']:
+    #         raise RuntimeError("MPC solver failed to find a solution.")
+    #     # Return the optimal control sequence
         
-        if plot_results:
-            x_pred = np.array(x_opt.full())          # shape: (2, N+1)
-            u_pred = np.array(u_opt.full()).flatten()  # shape: (N,)
+    #     if plot_results:
+    #         x_pred = np.array(x_opt.full())          # shape: (2, N+1)
+    #         u_pred = np.array(u_opt.full()).flatten()  # shape: (N,)
 
-            tx = np.arange(x_pred.shape[1]) * self.dt
-            tu = np.arange(u_pred.shape[0]) * self.dt
+    #         tx = np.arange(x_pred.shape[1]) * self.dt
+    #         tu = np.arange(u_pred.shape[0]) * self.dt
 
-            if not hasattr(self, "_opt_plot") or self._opt_plot is None:
-                fig, axes = plt.subplots(5, 1, figsize=(9, 8), sharex=False)
-                self._opt_plot = (fig, axes)
-            else:
-                fig, axes = self._opt_plot
-                for ax in axes:
-                    ax.clear()
+    #         if not hasattr(self, "_opt_plot") or self._opt_plot is None:
+    #             fig, axes = plt.subplots(5, 1, figsize=(9, 8), sharex=False)
+    #             self._opt_plot = (fig, axes)
+    #         else:
+    #             fig, axes = self._opt_plot
+    #             for ax in axes:
+    #                 ax.clear()
 
-            axes[0].plot(tx, x_pred[0], "g-o", linewidth=1.5, markersize=3)
-            axes[0].axhline(0.0, color="k", linestyle="--", alpha=0.4)
-            axes[0].set_ylim(-self.theta_bound*1.2, self.theta_bound*1.2)
-            axes[0].set_ylabel(r"$\theta_1$ (rad)")
-            axes[0].grid(True, alpha=0.3)
+    #         axes[0].plot(tx, x_pred[0], "g-o", linewidth=1.5, markersize=3)
+    #         axes[0].axhline(0.0, color="k", linestyle="--", alpha=0.4)
+    #         axes[0].set_ylim(-self.theta_bound*1.2, self.theta_bound*1.2)
+    #         axes[0].set_ylabel(r"$\theta_1$ (rad)")
+    #         axes[0].grid(True, alpha=0.3)
 
-            axes[1].plot(tx, x_pred[1], "c-o", linewidth=1.5, markersize=3)
-            axes[1].set_ylim(-self.omega_bound*1.2, self.omega_bound*1.2)
-            axes[1].set_ylabel(r"$\omega_1$ (rad/s)")
-            axes[1].grid(True, alpha=0.3)
+    #         axes[1].plot(tx, x_pred[1], "c-o", linewidth=1.5, markersize=3)
+    #         axes[1].set_ylim(-self.omega_bound*1.2, self.omega_bound*1.2)
+    #         axes[1].set_ylabel(r"$\omega_1$ (rad/s)")
+    #         axes[1].grid(True, alpha=0.3)
             
-            axes[2].plot(tx, x_pred[2], "m-o", linewidth=1.5, markersize=3)
-            axes[2].axhline(0.0, color="k", linestyle="--", alpha=0.4)
-            axes[2].set_ylim(-self.theta_bound*1.2, self.theta_bound*1.2)
-            axes[2].set_ylabel(r"$\theta_2$ (rad)")
-            axes[2].grid(True, alpha=0.3)
+    #         axes[2].plot(tx, x_pred[2], "m-o", linewidth=1.5, markersize=3)
+    #         axes[2].axhline(0.0, color="k", linestyle="--", alpha=0.4)
+    #         axes[2].set_ylim(-self.theta_bound*1.2, self.theta_bound*1.2)
+    #         axes[2].set_ylabel(r"$\theta_2$ (rad)")
+    #         axes[2].grid(True, alpha=0.3)
             
-            axes[3].plot(tx, x_pred[3], "b-o", linewidth=1.5, markersize=3)
-            axes[3].set_ylim(-self.omega_bound*1.2, self.omega_bound*1.2)
-            axes[3].set_ylabel(r"$\omega_2$ (rad/s)")
-            axes[3].grid(True, alpha=0.3)   
+    #         axes[3].plot(tx, x_pred[3], "b-o", linewidth=1.5, markersize=3)
+    #         axes[3].set_ylim(-self.omega_bound*1.2, self.omega_bound*1.2)
+    #         axes[3].set_ylabel(r"$\omega_2$ (rad/s)")
+    #         axes[3].grid(True, alpha=0.3)   
 
-            axes[4].plot(tu, u_pred, "k-", linewidth=1.8)
-            axes[4].set_ylim(-self.u_bound*1.2, self.u_bound*1.2)
-            axes[4].set_ylabel(r"$u$ (N m)")
-            axes[4].set_xlabel("Time (s)")
-            axes[4].grid(True, alpha=0.3)
+    #         axes[4].plot(tu, u_pred, "k-", linewidth=1.8)
+    #         axes[4].set_ylim(-self.u_bound*1.2, self.u_bound*1.2)
+    #         axes[4].set_ylabel(r"$u$ (N m)")
+    #         axes[4].set_xlabel("Time (s)")
+    #         axes[4].grid(True, alpha=0.3)
 
-            fig.suptitle("MPC Optimization (Predicted Trajectory)")
-            fig.tight_layout()
-            plt.show()
+    #         fig.suptitle("MPC Optimization (Predicted Trajectory)")
+    #         fig.tight_layout()
+    #         plt.show()
             
         # Return the first state
         return x_opt[:, 0].full().flatten()  # return the first state in the optimal trajectory
@@ -586,7 +586,7 @@ class FurutaPendulum:
 
         return x_traj, u_traj, anim
         
-    def close_loop_simulation(self, x0, Nsim = 60, control_policy=None, plot_results=True):
+    def close_loop_simulation(self, x0, Nsim=60, control_policy=None, plot_results=True, fail_on_mpc_failure=False):
         """Simulate the cart-pole system and plot the results.
         
         Parameters
@@ -600,6 +600,9 @@ class FurutaPendulum:
             Number of simulation steps (default: 60).
         plot_results : bool, optional
             Whether to plot the results (default: True).
+        fail_on_mpc_failure : bool, optional
+            If True, raise an exception when the internal MPC solve fails.
+            If False, keep previous behavior and continue simulation.
         
         Returns
         -------
@@ -626,7 +629,14 @@ class FurutaPendulum:
             
             # Check if is a scalar
             if u_k is None:
-                print("Control is None")
+                status = self.solver.stats().get("return_status", "unknown")
+                msg = (
+                    f"MPC returned None at step {k} for state {x_traj[k].tolist()} "
+                    f"(solver status: {status})"
+                )
+                if fail_on_mpc_failure:
+                    raise RuntimeError(msg)
+                print(msg)
                 continue
             
             # Ensure u_k is scalar
@@ -649,7 +659,6 @@ class FurutaPendulum:
         time_u = np.arange(Nsim) * self.dt
         
         fig, axes = plt.subplots(5, 1, figsize=(10, 10))
-        title = "Inverted-Pendulum Simulation"
         
         # Angle
         axes[0].plot(time, x_traj[:, 0], 'g-', linewidth=2)
@@ -687,7 +696,7 @@ class FurutaPendulum:
     
 if __name__ == "__main__":
     # Create cart-pole environment
-    fur_pend = FurutaPendulum(dt=0.05, sym_type='SX')
+    fur_pend = FurutaPendulum(dt=0.06, sym_type='SX')
     
     # Example usage: simulate with zero control input
     theta_1_bound = np.pi
@@ -696,16 +705,17 @@ if __name__ == "__main__":
     omega_2_bound = 1.0
     theta1_0 = np.random.uniform(-theta_1_bound, theta_1_bound)
     # x0 = [theta1_0, omega1_0, theta2_0, omega2_0]
-    x0 = [theta1_0, 0, 0.0, 0]
+    x0 = [0.1, 0, 0.0, 0]
+    # x0 = [theta1_0, 0.0, 0.0, 0.0]
     # print (f"Initial state: {x0_dump}")
     # N = 10  # number of simulation steps
     # control_policy = lambda x: np.array([0.0])  # zero control input
     
     # X0 = inv_pend.solve_extreme_x0(N, plot_results=False)
     print(x0)
-    fur_pend.close_loop_simulation(x0, Nsim=30)
+    fur_pend.close_loop_simulation(x0, Nsim=12)
     # Animate
     # x0 = [0.0, 0.0, np.pi/6, 0.0]  # Small initial angle
     # x_traj, u_traj, anim = fur_pend.animate(
-    #     x0, control_policy=None)  # 50ms between frames
+    #     x0, control_policy=None, Nsim=40)  # 50ms between frames
         # save_path='inv_pend.gif'  # Optional: save to file

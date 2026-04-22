@@ -28,15 +28,12 @@ class FurutaPendulumRNN:
         self,
         hidden_sizes=[2, 6, 6, 1],
         batch_size=80,
-        horizon=20,
+        horizon=10,
         degree=3,
         beta=0.5,
-        q_weights=[100, 1, 30, 1],
-        r_weight=0.01,
         regularization=1e-4,
         seed=42,
         complementarity_constraints=True,
-        tau=1.0,
         model_dir=None,
     ):
         """Initialize the MPC approximation problem.
@@ -54,10 +51,6 @@ class FurutaPendulumRNN:
             Degree of collocation polynomials.
         beta : float
             Softplus activation beta parameter.
-        q_weights : list of float
-            State cost weights [position, velocity, angle, angular_velocity].
-        r_weight : float
-            Control cost weight.
         regularization : float
             L2 regularization weight on network parameters.
         seed : int
@@ -76,30 +69,20 @@ class FurutaPendulumRNN:
         self.regularization = regularization
         self.seed = seed
         self.complementarity_constraints = complementarity_constraints
-        self.tau = tau
-        
-        # Cost weights
-        self.Q = ca.diag(ca.DM(q_weights))
-        self.R = ca.diag(ca.DM([r_weight]))
-        
-        # Reference trajectory
-        self.xr = ca.DM([0.0, 0.0, 0.0, 0.0])
-        self.ur = ca.DM([0.0])
         
         # State bounds
-        self.theta_1_bound = np.pi
-        self.omega_1_bound = 20.0
-        self.theta_2_bound = np.pi
-        self.omega_2_bound = 20.0
+        self.theta_1_bound = ca.inf
+        self.omega_1_bound = ca.inf
+        self.theta_2_bound = ca.inf
+        self.omega_2_bound = ca.inf
         
         # Training bounds
-        alpha = 0.5
-        self.theta_train_bound = alpha * self.theta_1_bound
-        self.omega_train_bound = alpha * self.omega_1_bound
+        self.theta_1_train_bound = np.pi
+        # self.omega_train_bound = alpha * self.omega_1_bound
         
         # Control bounds
-        self.u_min = -5.0
-        self.u_max = 5.0
+        self.u_min = -10.0
+        self.u_max = 10.0
         
         # Setup model directory
         if model_dir is None:
@@ -110,7 +93,7 @@ class FurutaPendulumRNN:
         self.model_name = self.get_model_name()
         
         # Initialize furuta pendulum system
-        self.furuta_pend = FurutaPendulum(sym_type='SX')
+        self.furuta_pend = FurutaPendulum(dt=0.05, sym_type='SX')
         
         # Set random seed
         np.random.seed(self.seed)
@@ -170,7 +153,7 @@ class FurutaPendulumRNN:
         )
         # Build the RNN
         h0 = np.zeros((self.hidden_sizes[0], 1))
-        result = rnn.build(hidden_seq, h0, tau=self.tau)
+        result = rnn.build(hidden_seq, h0)
         
         # Get parameters from build result
         self.params_flattened = result["params_flat"]
@@ -206,7 +189,7 @@ class FurutaPendulumRNN:
         )
         # Build the RNN
         h0 = np.zeros((self.hidden_sizes[0], 1))
-        result = rnn.build(hidden_seq, h0, tau=self.tau)
+        result = rnn.build(hidden_seq, h0)
         
         # Get parameters and complementarity variables from build result
         self.params_flattened = result["params_flat"]
@@ -277,16 +260,16 @@ class FurutaPendulumRNN:
             print(f"Generated {len(extreme_x0)} informative initial states. Generating {num_random} random initial states.")
             if num_random > 0:
                 X_random = np.random.uniform(
-                    low=np.array([-self.theta_1_bound, -self.omega_1_bound, -self.theta_2_bound, -self.omega_2_bound]).reshape(-1, 1),
-                    high=np.array([self.theta_1_bound, self.omega_1_bound, self.theta_2_bound, self.omega_2_bound]).reshape(-1, 1),
+                    low=np.array([-self.theta_1_bound, 0, 0, 0]).reshape(-1, 1),
+                    high=np.array([self.theta_1_bound, 0, 0, 0]).reshape(-1, 1),
                     size=(self.NX, num_random)
                 )
                 self.X_train = np.hstack((self.X_train, X_random))
                 
         else:
             self.X_train = np.random.uniform(
-                low=np.array([-self.theta_1_bound, -self.omega_1_bound, -self.theta_2_bound, -self.omega_2_bound]).reshape(-1, 1),
-                high=np.array([self.theta_1_bound, self.omega_1_bound, self.theta_2_bound, self.omega_2_bound]).reshape(-1, 1),
+                low=np.array([-self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
+                high=np.array([self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
                 size=(self.NX, self.NB)
             )
         # print(self.X_train[:, :5])
@@ -359,13 +342,20 @@ class FurutaPendulumRNN:
     
     def solve_closed_loop_MPC_for_initial_states(self):
         """Solve closed-loop MPC for each initial state to generate initial guess trajectories. """
-        # Define a problem with horizon > N
-        self.furuta_pend.define_simple_MPC_control(N=self.N+10)
+        # Rebuild the internal MPC with the same horizon used in this training problem.
+        self.furuta_pend.define_simple_MPC_control(N=self.N, seek_x0=False)
         self.initial_trajectories = np.zeros((self.NX, self.N + 1, self.NB))
         self.initial_controls = np.zeros((self.NU, self.N, self.NB))
         for i in range(self.NB):
             # Simulate forward in time
-            x_traj, u_traj = self.furuta_pend.close_loop_simulation(self.X_train[:, i], Nsim=self.N, plot_results=False)
+            x0_i = self.X_train[:, i]
+            print(f"Warm-start closed-loop rollout {i + 1}/{self.NB}, x0={x0_i}")
+            x_traj, u_traj = self.furuta_pend.close_loop_simulation(
+                x0_i,
+                Nsim=self.N,
+                plot_results=False,
+                fail_on_mpc_failure=True,
+            )
             # Store trajectories
             # Check if 
             self.initial_trajectories[:, :, i] = x_traj.T
@@ -479,6 +469,7 @@ class FurutaPendulumRNN:
             # Generate initial trajectories by solving closed-loop MPC for each initial state
             # Warm starts both state and control actions
             self.solve_closed_loop_MPC_for_initial_states()
+            raise NotImplementedError("MPC warm start generation complete. Call setup_optimization() again to set up the optimization problem with the generated warm start.")
             state_warm_start = {}
             control_warm_start = {}
             for i in range(self.NB):
@@ -498,13 +489,7 @@ class FurutaPendulumRNN:
         x = ca.SX.sym('x', self.NX)
         u = ca.SX.sym('u', self.NU)
         x_dot = self.furuta_pend.dynamics(x, u)
-        l = (x - self.xr).T @ self.Q @ (x - self.xr) + (u - self.ur).T @ self.R @ (u - self.ur)
-        f = ca.Function('f', [x, u], [x_dot, l], ['x', 'u'], ['x_dot', 'l'])
-        
-        # Compute LQR terminal cost matrix
-        A, B = self.furuta_pend.lin_dyn(self.xr, self.ur)
-        E = solve_continuous_are(A.full(), B.full(), self.Q.full(), self.R.full())
-        E_dm = ca.DM(E)
+        f = ca.Function('f', [x, u], [x_dot], ['x', 'u'], ['x_dot'])
         
         # Initialize NLP structures
         w = []      # decision variables
@@ -516,6 +501,33 @@ class FurutaPendulumRNN:
         lbg = []    # lower bounds on constraints
         ubg = []    # upper bounds on constraints
         
+        # Complementarity pair types for ccopt
+        varcon = 1  # first index into x, second index into g
+        ind_cc = []
+        cctypes = []
+        cc_var_sizes = []
+        cc_first_constr_offsets = []
+        if self.complementarity_constraints:
+            if len(self.cc_vars) == 0:
+                raise ValueError("Complementarity mode enabled but no complementarity variables were created.")
+
+            # Each complementarity variable contributes one or more constraint blocks
+            # in cc_fcn (e.g., only h-z, or [h-z, h*(h-z)]). Infer this from cc_g.
+            if len(self.cc_g) % len(self.cc_vars) != 0:
+                raise ValueError(
+                    "Unexpected complementarity layout: number of constraints is not a multiple "
+                    "of complementarity variables. Update ind_cc construction accordingly."
+                )
+
+            cc_blocks_per_var = len(self.cc_g) // len(self.cc_vars)
+            cc_offset = 0
+            for cc_var in self.cc_vars:
+                cc_size = int(cc_var.size1() * cc_var.size2())
+                cc_var_sizes.append(cc_size)
+                # Pair with the first constraint block for this variable (h-z block).
+                cc_first_constr_offsets.append(cc_offset)
+                cc_offset += cc_blocks_per_var * cc_size
+        
         # Add consensus parameters as decision variables
         z = ca.SX.sym('z', self.n_param)
         w += [z]
@@ -525,17 +537,18 @@ class FurutaPendulumRNN:
         
         # Define one NLP for each batch element
         for i in range(self.NB):
-            # Generate random initial state for this batch element
-            # theta0 = np.random.uniform(-self.theta_train_bound, self.theta_train_bound)
-            # omega0 = np.random.uniform(-self.omega_train_bound, self.omega_train_bound)
             x0 = self.X_train[:, i]
-            x_target = np.array([0.0, 0.0])  # Target state (origin)
+            x_target = np.array([np.pi, 0.0, np.pi, 0.0])  # Target state
             
             # Initial state
             Xk = ca.SX.sym('X_' + str(i) + '_0', self.NX)
             w += [Xk]
             lbw += x0.tolist()
             ubw += x0.tolist()
+            
+            # Add the contribution of the initial state to the cost
+            J += self.furuta_pend.init_cost(Xk, x0)
+            
             # Use warm start if available
             if state_warm_start is not None:
                 w0 += state_warm_start[(i, 0)].tolist()
@@ -543,11 +556,13 @@ class FurutaPendulumRNN:
                 w0 += x0.tolist()
 
             cc_step_vars = []
+            cc_var_x_offsets = []
             if self.complementarity_constraints:
                 for layer_idx, cc_var in enumerate(self.cc_vars):
                     nrow, ncol = cc_var.shape
                     y_var = ca.SX.sym(f"Y_{i}_{layer_idx}", nrow, ncol)
                     cc_step_vars.append(y_var)
+                    cc_var_x_offsets.append(len(lbw))
                     w += [y_var]
                     lbw += [0.0] * (nrow * ncol)
                     ubw += [ca.inf] * (nrow * ncol)
@@ -594,7 +609,7 @@ class FurutaPendulumRNN:
                         xp = xp + C_coeff[r + 1, j] * Xc[r]
                     
                     # Append collocation equations
-                    fj, qj = f(Xc[j - 1], u_k)
+                    fj = f(Xc[j - 1], u_k)
                     g += [self.furuta_pend.dt * fj - xp]
                     lbg += [0.0] * self.NX
                     ubg += [0.0] * self.NX
@@ -602,8 +617,8 @@ class FurutaPendulumRNN:
                     # Add contribution to the end state
                     Xk_end = Xk_end + D_coeff[j] * Xc[j - 1]
                     
-                    # Add contribution to quadrature function
-                    J += B_coeff[j] * qj * self.furuta_pend.dt
+                # Add contribution of stage cost
+                J += self.furuta_pend.stage_cost(Xk, u_k)
                 
                 # Next state
                 Xk = ca.SX.sym('X_' + str(i) + '_' + str(k + 1), self.NX)
@@ -630,6 +645,16 @@ class FurutaPendulumRNN:
                 g += [u_i - self.net_fcn(x0, z, *cc_step_vars)]
                 lbg += [0.0] * self.NU * self.N 
                 ubg += [0.0] * self.NU * self.N
+                
+                # Pair each Y component with its corresponding (h-z) constraint.
+                # ccopt expects one-indexed indices for both x and g.
+                cc_g_start = len(lbg)
+                for layer_idx, cc_size in enumerate(cc_var_sizes):
+                    x_start = cc_var_x_offsets[layer_idx]
+                    g_start = cc_g_start + cc_first_constr_offsets[layer_idx]
+                    for elem_idx in range(cc_size):
+                        ind_cc.append([x_start + elem_idx + 1, g_start + elem_idx + 1])
+                        cctypes.append(varcon)
                     
                 # Add complementarity constraints for this step
                 g += [self.cc_fcn(x0, z, *cc_step_vars)]
@@ -642,7 +667,7 @@ class FurutaPendulumRNN:
                 ubg += [0.0] * self.NU * self.N
             
             # Add terminal cost
-            J += (Xk - self.xr).T @ E_dm @ (Xk - self.xr)
+            J += self.furuta_pend.terminal_cost(Xk)
         
         # Average cost over the batch
         # J *= 1.0 / self.NB
@@ -668,25 +693,24 @@ class FurutaPendulumRNN:
         constraints_num = sum([constr.size1() * constr.size2() for constr in g])
         print(f"Number of decision variables: {decision_variables_num}")
         print(f"Number of constraints: {constraints_num}")
+        print(f"Number of complementarity pairs: {len(ind_cc)}")
         
         # Create the NLP solver
         print("Creating NLP solver...")
         start_time = time.time()
         opts = {
             "expand": True,
-            "ipopt": {
-                "print_level": 5,
-                "max_iter": 5000,
-                "tol": 1e-6,
-                "hsllib": "/home/pietro/ThirdParty-HSL/coinhsl-2024.05.15/install/lib/x86_64-linux-gnu/libcoinhsl.so",
-                "linear_solver": "ma86",
-                "warm_start_init_point": "yes",
-                "warm_start_bound_push": 1e-6,
-                "warm_start_bound_frac": 1e-6,
-                # "mu_strategy": "adaptive",
-            }
+            # ccopt delegates NLP solves to MadNLP; bound_relax_factor=0.0 is
+            # important for complementarity formulations.
+            "ind_cc": ind_cc,
+            "cctypes": cctypes,
+            # "madnlp.print_level": 5,
+            "madnlp.max_iter": 5000,
+            "madnlp.tol": 1e-6,
+            "madnlp.bound_relax_factor": 0.0,
+            "madnlp.linear_solver": "Ma27Solver",
         }
-        self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
+        self.solver = ca.nlpsol('solver', 'ccopt', nlp, opts)
         print(f"Solver creation time: {time.time() - start_time:.2f} seconds")
     
     def solve(self):
@@ -829,7 +853,6 @@ class FurutaPendulumRNN:
                 "hidden_sizes": self.hidden_sizes,
                 "model_name": self.model_name,
                 "batch_size": int(self.NB),
-                "tau": float(self.tau),
                 "horizon": int(self.N),
                 "date": date_str,
             }
@@ -987,50 +1010,27 @@ class FurutaPendulumRNN:
         return latest_file
 
 def main():
-    tau_init = 1.0 * 1e-0
-    tau_k = tau_init
-    tau_min = 1.0 * 1e-3
-    warm_params = None
-    
-    while tau_k >= tau_min:
-        print(f"Testing with tau = {tau_k:.2e}")
-        # Configure the problem
-        mpc = FurutaPendulumRNN(
-            hidden_sizes=[6, 6],
-            batch_size=50,
-            horizon=10,
-            degree=3,
-            q_weights=[10, 5, 100, 1],
-            r_weight=0.01,
-            regularization=1e-4,
-            seed=42,
-            complementarity_constraints=True,
-            tau=tau_k,
-        )
-    
-        # mpc.generate_initial_states()
-    
-        # Initialize params with warm start
-        # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
-        # warm_params = None
-        # if tau_k == tau_init:
-        #     params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
-        #     warm_params = mpc.initialize_parameters(params_file)
+    # Configure the problem
+    mpc = FurutaPendulumRNN(
+        hidden_sizes=[6, 6],
+        batch_size=50,
+        horizon=12,
+        degree=3,
+        regularization=1e-4,
+        seed=42,
+        complementarity_constraints=True,
+    )
 
-        # Setup and solve the optimization problem
-        mpc.setup_optimization(warm_params, warm_start='mpc')
-        mpc.solve()
-        if mpc.solver.stats()['success']:
-            print("\nOptimization successful!")
-            # Extract solution for next iteration
-            warm_params = mpc.optimal_params.copy()
-            tau_k *= 0.1  # Increase beta for next iteration
-        else:
-            print("\nOptimization failed. Stopping training.")
-            break
-    
-        # Clean up solver resources for memory efficiency
-        gc.collect()
+    # Initialize params with warm start
+    # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
+    warm_params = None
+    # if tau_k == tau_init:
+    #     params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+    #     warm_params = mpc.initialize_parameters(params_file)
+
+    # Setup and solve the optimization problem
+    mpc.setup_optimization(warm_params, warm_start='mpc')
+    mpc.solve()
     
     # Visualize results
     mpc.plot_results()
