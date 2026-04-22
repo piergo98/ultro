@@ -36,7 +36,6 @@ class InvertedPendulumRNN:
         regularization=1e-4,
         seed=42,
         complementarity_constraints=True,
-        tau=1.0,
         model_dir=None,
     ):
         """Initialize the MPC approximation problem.
@@ -76,7 +75,6 @@ class InvertedPendulumRNN:
         self.regularization = regularization
         self.seed = seed
         self.complementarity_constraints = complementarity_constraints
-        self.tau = tau
         
         # Cost weights
         self.Q = ca.diag(ca.DM(q_weights))
@@ -168,7 +166,7 @@ class InvertedPendulumRNN:
         )
         # Build the RNN
         h0 = np.zeros((self.hidden_sizes[0], 1))
-        result = rnn.build(hidden_seq, h0, tau=self.tau)
+        result = rnn.build(hidden_seq, h0)
         
         # Get parameters from build result
         self.params_flattened = result["params_flat"]
@@ -204,7 +202,7 @@ class InvertedPendulumRNN:
         )
         # Build the RNN
         h0 = np.zeros((self.hidden_sizes[0], 1))
-        result = rnn.build(hidden_seq, h0, tau=self.tau)
+        result = rnn.build(hidden_seq, h0)
         
         # Get parameters and complementarity variables from build result
         self.params_flattened = result["params_flat"]
@@ -844,7 +842,6 @@ class InvertedPendulumRNN:
                 "hidden_sizes": self.hidden_sizes,
                 "model_name": self.model_name,
                 "batch_size": int(self.NB),
-                "tau": float(self.tau),
                 "horizon": int(self.N),
                 "date": date_str,
             }
@@ -1002,12 +999,6 @@ class InvertedPendulumRNN:
         return latest_file
 
 def main():
-    tau_init = 1.0 * 1e-6
-    tau_k = tau_init
-    tau_min = 1.0 * 1e-6
-    warm_params = None
-    
-    print(f"Testing with tau = {tau_k:.2e}")
     # Configure the problem
     mpc = InvertedPendulumRNN(
         hidden_sizes=[6, 6],
@@ -1019,7 +1010,6 @@ def main():
         regularization=1e-4,
         seed=42,
         complementarity_constraints=True,
-        tau=tau_k,
     )
     
     # mpc.generate_initial_states()
@@ -1033,16 +1023,6 @@ def main():
     # Setup and solve the optimization problem
     mpc.setup_optimization(warm_params, warm_start='mpc')
     mpc.solve()
-    if mpc.solver.stats()['success']:
-        print("\nOptimization successful!")
-        # Extract solution for next iteration
-        warm_params = mpc.optimal_params.copy()
-        tau_k *= 0.1  # Increase beta for next iteration
-    else:
-        print("\nOptimization failed. Stopping training.")
-    
-        # # Clean up solver resources for memory efficiency
-        # gc.collect()
     
     # Visualize results
     mpc.plot_results()
