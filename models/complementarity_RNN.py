@@ -25,8 +25,9 @@ class ComplementarityRNN:
 		----------
 		input_size : int
 			Number of features in the input.
-		hidden_size : int
+		hidden_size : int, list
 			Number of features in the hidden state.
+			Can be an int for single layer or list of ints for multiple layers.
 		output_size : int
 			Number of features in the output.
 		sym_type : str, optional
@@ -45,7 +46,11 @@ class ComplementarityRNN:
     
     """
 		self.input_size = int(input_size)
-		self.hidden_size = int(hidden_size)
+		# Check if hidden_size is a list for multiple layers
+		if isinstance(hidden_size, list):
+			self.hidden_size = [int(size) for size in hidden_size]
+		else:
+			self.hidden_size = [int(hidden_size)]
 		if output_size > 0:
 			self.output_size = int(output_size)
 			self.output_layer = True
@@ -62,13 +67,20 @@ class ComplementarityRNN:
 
 	def _count_parameters(self):
 		"""Count total number of parameters for the RNN."""
-		count = self.hidden_size * self.input_size
-		count += self.hidden_size * self.hidden_size
-		if self.use_bias:
-			count += self.hidden_size
-		count += self.output_size * self.hidden_size
-		if self.output_bias:
-			count += self.output_size
+		count = 0
+		for i, size in enumerate(self.hidden_size):
+			if i == 0:
+				input_dim = self.input_size
+			else:
+				input_dim = self.hidden_size[i - 1]
+			count += size * input_dim  # W_x
+			count += size * size  # W_h
+			if self.use_bias:
+				count += size  # b_h
+		if self.output_layer:
+			count += self.output_size * self.hidden_size[-1]  # W_y
+			if self.output_bias:
+				count += self.output_size  # b_y
 		return count
 
 	def _sym(self, label, nrow, ncol=1):
@@ -78,36 +90,44 @@ class ComplementarityRNN:
 
 	def create_parameters(self):
 		"""Create symbolic parameters (weights and biases)."""
-		W_x = self._sym(f"{self.name}_W_x", self.hidden_size, self.input_size)
-		W_h = self._sym(f"{self.name}_W_h", self.hidden_size, self.hidden_size)
-		b_h = None
-		if self.use_bias:
-			b_h = self._sym(f"{self.name}_b_h", self.hidden_size, 1)
+		params = []
+		flat_parts = []
+		for i, size in enumerate(self.hidden_size):
+			if i == 0:
+				input_dim = self.input_size
+			else:
+				input_dim = self.hidden_size[i - 1]
+			W_x = self._sym(f"{self.name}_W_x{i}", size, input_dim)
+			W_h = self._sym(f"{self.name}_W_h{i}", size, size)
+			params.extend([W_x, W_h])
+			flat_parts.extend([ca.reshape(W_x, -1, 1), ca.reshape(W_h, -1, 1)])
+			b_h = None
+			if self.use_bias:
+				b_h = self._sym(f"{self.name}_b_h{i}", size, 1)
+				params.append(b_h)
+				flat_parts.append(ca.reshape(b_h, -1, 1))
+    
 		if self.output_layer:
-			W_y = self._sym(f"{self.name}_W_y", self.output_size, self.hidden_size)
+			size = self.hidden_size[-1]
+			W_y = self._sym(f"{self.name}_W_y", self.output_size, size)
+			params.append(W_y)
+			flat_parts.append(ca.reshape(W_y, -1, 1))
+   
 			b_y = None
 			if self.output_bias:
 				b_y = self._sym(f"{self.name}_b_y", self.output_size, 1)
-
-		flat_parts = [ca.reshape(W_x, -1, 1), ca.reshape(W_h, -1, 1)]
-		if b_h is not None:
-			flat_parts.append(ca.reshape(b_h, -1, 1))
-		if self.output_layer:
-			flat_parts.append(ca.reshape(W_y, -1, 1))
-			if b_y is not None:
+				params.append(b_y)
 				flat_parts.append(ca.reshape(b_y, -1, 1))
 
-				params = (W_x, W_h, b_h, W_y, b_y)
-			else:
-				params = (W_x, W_h, b_h, W_y)
-		else:
-			params = (W_x, W_h, b_h)
+		# Create the params tuple in the expected order
+		params = tuple(params)
 		
+		# The flat parameter vector is created by concatenating the flattened weight and bias matrices.
 		params_flat = ca.vertcat(*flat_parts) if flat_parts else self._sym(f"{self.name}_params", 0, 1)
    
 		return params, params_flat
 
-	def build(self, x_seq, h0=None, params=None, tau=1.0):
+	def build(self, x_seq, h0=None, tau=1.0):
 		"""Build RNN output and complementarity constraints for a sequence.
 
 		Parameters
@@ -116,8 +136,6 @@ class ComplementarityRNN:
 			Input sequence matrix with shape (input_size, horizon).
 		h0 : casadi.SX or casadi.MX, optional
 			Initial hidden state (hidden_size, 1). If None, a symbolic input is created.
-		params : tuple, optional
-			(W_x, W_h, b_h, W_y, b_y). If None, they are created symbolically.
 		tau : float, optional
 			Relaxation parameter for complementarity constraints.
 
@@ -128,21 +146,16 @@ class ComplementarityRNN:
 		"""
 		if self.activation != "relu":
 			raise ValueError("Only 'relu' activation is supported in complementarity form.")
-		if params is None:
-			params, params_flat = self.create_parameters()
-		else:
-			params_flat = None
-		if self.output_layer and self.output_bias:
-			W_x, W_h, b_h, W_y, b_y = params
-		elif self.output_layer and not self.output_bias:
-			W_x, W_h, b_h, W_y = params
-			b_y = None
-		else:
-			W_x, W_h, b_h = params
-			W_y, b_y = None, None
+		
+		# Extract parameters
+		params, params_flat = self.create_parameters()
+		
+		W_x = params[0]
+		W_h = params[1]
+		b_h = params[2] if self.use_bias else None
 
 		if h0 is None:
-			h_prev = self._sym(f"{self.name}_h0", self.hidden_size, 1)
+			h_prev = self._sym(f"{self.name}_h0", self.hidden_size[0], 1)
 		else:
 			h_prev = h0
 		# TODO: add support for multiple RNN layers
@@ -158,32 +171,46 @@ class ComplementarityRNN:
 
 		for t in range(self.horizon):
 			x_t = x_seq[:, t]
-			z_t = W_x @ x_t + W_h @ h_prev
-			if b_h is not None:
-				z_t = z_t + b_h
+			for i in range(len(self.hidden_size)):
+				if self.use_bias:
+					W_x = params[3 * i]
+					W_h = params[3 * i + 1]
+					b_h = params[3 * i + 2]
+				else:
+					W_x = params[2 * i]
+					W_h = params[2 * i + 1]
+					b_h = None
+				z_t = W_x @ x_t + W_h @ h_prev
+				if b_h is not None:
+					z_t = z_t + b_h
 
-			if self.complementarity:
-				h_t = self._sym(f"{self.name}_h{t}", self.hidden_size, 1)
-				vars_list.append(h_t)
-				lbw.extend([0.0] * self.hidden_size)
-				ubw.extend([ca.inf] * self.hidden_size)
+				if self.complementarity:
+					h_t = self._sym(f"{self.name}_h{t}_{i}", self.hidden_size[i], 1)
+					vars_list.append(h_t)
+					lbw.extend([0.0] * self.hidden_size[i])
+					ubw.extend([ca.inf] * self.hidden_size[i])
 
-				# h - z >= 0
-				g.append(h_t - z_t)
-				lbg.extend([0.0] * self.hidden_size)
-				ubg.extend([ca.inf] * self.hidden_size)
+					# h - z >= 0
+					g.append(h_t - z_t)
+					lbg.extend([0.0] * self.hidden_size[i])
+					ubg.extend([ca.inf] * self.hidden_size[i])
 
-				# h * (h - z) <= tau
-				g.append(h_t * (h_t - z_t))
-				lbg.extend([-ca.inf] * self.hidden_size)
-				ubg.extend([tau] * self.hidden_size)
+					# h * (h - z) <= tau
+					# g.append(h_t * (h_t - z_t))
+					# lbg.extend([-ca.inf] * self.hidden_size[i])
+					# ubg.extend([tau] * self.hidden_size[i])
 
-			else:
-				h_t = ca.fmax(z_t, 0)
+				else:
+					h_t = ca.fmax(z_t, 0)
 
-			y_t = W_y @ h_t
-			if b_y is not None:
-				y_t = y_t + b_y
+				# If there are multiple layers, the output of the current layer becomes the input to the next layer
+				x_t = h_t
+			if self.output_layer:
+				W_y = params[-2] if self.output_bias else params[-1]
+				b_y = params[-1] if self.output_bias else None
+				y_t = W_y @ h_t
+				if b_y is not None:
+					y_t = y_t + b_y
 			output_list.append(y_t)
 			hidden_list.append(h_t)
 			h_prev = h_t
