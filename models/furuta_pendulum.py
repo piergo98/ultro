@@ -78,7 +78,9 @@ class FurutaPendulum:
         )
 
         rhs = ca.vertcat(rhs1, rhs2)
-        ddq = ca.solve(self._mass_matrix(theta2), rhs)
+        M = self._mass_matrix(theta2)
+        M_reg = M + 1e-6 * ca.DM.eye(2)
+        ddq = ca.solve(M_reg, rhs)
 
         xdot = ca.vertcat(theta1p, ddq[0], theta2p, ddq[1])
         return ca.Function('dynamics', [x, u], [xdot])
@@ -601,7 +603,7 @@ class FurutaPendulum:
         # Return the first state
         return x_opt[:, 0].full().flatten()  # return the first state in the optimal trajectory
 
-    def animate(self, x0, Nsim=120, interval=40, repeat=False,
+    def animate(self, x0, Nsim=120, interval=40, repeat=False, control_policy=None,
         save_path=None, fps=25, show=True, show_desired=True, desired_state=None,
         show_motion_plane=False):
         """Run a closed-loop simulation and animate the Furuta pendulum motion.
@@ -616,6 +618,8 @@ class FurutaPendulum:
             Delay between frames in milliseconds.
         repeat : bool, optional
             Whether the animation should repeat.
+        control_policy : callable or None, optional
+            Control policy to use for the simulation. If None, uses the default policy.
         save_path : str or None, optional
             If provided, save animation to this path (e.g. ``.gif`` or ``.mp4``).
         fps : int, optional
@@ -643,6 +647,7 @@ class FurutaPendulum:
             x0=x0,
             Nsim=Nsim,
             plot_results=False,
+            control_policy=control_policy,
         )
 
         theta1 = x_traj[:, 0]
@@ -811,7 +816,7 @@ class FurutaPendulum:
 
         return x_traj, u_traj, anim
         
-    def close_loop_simulation(self, x0, Nsim=60, plot_results=True, on_mpc_failure='skip', warm_start=True):
+    def close_loop_simulation(self, x0, Nsim=60, plot_results=True, control_policy=None, on_mpc_failure='skip', warm_start=True):
         """Simulate the cart-pole system and plot the results.
         
         Parameters
@@ -822,6 +827,8 @@ class FurutaPendulum:
             Number of simulation steps (default: 60).
         plot_results : bool, optional
             Whether to plot the results (default: True).
+        control_policy : callable or None, optional
+            Control policy to use for the simulation. If None, uses the default MPC policy.
         on_mpc_failure : str, optional
             If 'fail', raise an exception when the internal MPC solve fails.
             If 'skip', keep previous behavior and continue simulation.
@@ -844,14 +851,17 @@ class FurutaPendulum:
         # Simulate forward in time
         for k in range(Nsim):
             # Get control input
-            if warm_start:
-                solve_result = self.solve_MPC(x_traj[k], return_traj=True)
-                if solve_result is None:
-                    u_k = None
+            if control_policy is None:
+                if warm_start:
+                    solve_result = self.solve_MPC(x_traj[k], return_traj=True)
+                    if solve_result is None:
+                        u_k = None
+                    else:
+                        u_k, x_opt, u_opt = solve_result
                 else:
-                    u_k, x_opt, u_opt = solve_result
+                    u_k = self.solve_MPC(x_traj[k])  # Solve MPC to get control input for current state
             else:
-                u_k = self.solve_MPC(x_traj[k])  # Solve MPC to get control input for current state
+                u_k = control_policy(x_traj[k])  # Use provided control policy
             
             # Check if is a scalar
             if u_k is None:
@@ -879,7 +889,7 @@ class FurutaPendulum:
             x_next = self.step(x_traj[k], [u_k])
             x_traj[k + 1] = np.array(x_next.full()).flatten()
 
-            if warm_start:
+            if warm_start and control_policy is None and solve_result is not None:
                 if np.isfinite(x_opt.full()).all() and np.isfinite(u_opt.full()).all():
                     self.shift_w0(x_traj[k + 1], x_opt, u_opt)
                 else:

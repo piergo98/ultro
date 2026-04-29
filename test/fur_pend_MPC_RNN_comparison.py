@@ -191,11 +191,11 @@ class FurutaPendulumMPC_RNNComparison:
             self.X_test = np.zeros((self.NX, 0))
             num_random = n_test
         np.random.seed(seed)
-        self.theta_1_test_bound = np.pi
+        theta_1_test_bound = np.pi
         
         X_random = np.random.uniform(
-            low=np.array([-self.theta_1_test_bound, 0, 0, 0]).reshape(-1, 1),
-            high=np.array([self.theta_1_test_bound, 0, 0, 0]).reshape(-1, 1),
+            low=np.array([-theta_1_test_bound, 0, 0, 0]).reshape(-1, 1),
+            high=np.array([theta_1_test_bound, 0, 0, 0]).reshape(-1, 1),
             size=(self.NX, num_random)
         )
         self.X_test = np.hstack((self.X_test, X_random))
@@ -236,7 +236,7 @@ class FurutaPendulumMPC_RNNComparison:
         """Load parameters for the learned policy."""
         model_name = get_model_name(self.hidden_sizes)
         params_file = self.find_latest_params(self.model_dir, model_name, "yaml")
-        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_inverted_pendulum/optimal_params_ip_cc_6x6_2026-03-27_18-42-41.yaml"
+        # params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_furuta_pendulum/optimal_params_fp_cc_6x6_2026-04-29_11-06-42.yaml"
         if params_file is None:
             raise FileNotFoundError(f"No parameter files found for model {model_name} in {self.model_dir}")
         self.params_init_vec = load_params(params_file)
@@ -295,7 +295,7 @@ class FurutaPendulumMPC_RNNComparison:
             if (i + 1) % 5 == 0:
                 print(f"Completed {i + 1}/{N_TEST} test cases")
         
-    def run_closed_loop_comparison(self, Nsim=60):
+    def run_closed_loop_comparison(self, Nsim=60, split_fraction=2 / 3, seed=42):
         """Run a closed-loop comparison between optimal MPC and learned policy.
         
         Parameters
@@ -313,64 +313,126 @@ class FurutaPendulumMPC_RNNComparison:
         
         N_TEST = self.X_test.shape[1]
         print(f"Running closed-loop comparison for {N_TEST} initial states...")
-        
-        # Clear previous results
-        self.x_opt_batch = []
-        self.u_opt_batch = []
-        self.x_sim_batch = []
-        self.u_sim_batch = []
-        self.rmse_states_batch = []
-        self.rmse_u_batch = []
-        self.cost_opt_batch = []
-        self.cost_sim_batch = []
-        self.valid_indices = []
-        
-        # Run closed-loop simulation for each initial state
-        for i in range(N_TEST):
-            x0 = self.X_test[:, i]
 
-            # Simulate the learned policy in closed loop for the same initial state
-            x_sim = np.zeros((self.NX, Nsim + 1))
-            u_sim = np.zeros((self.NU, Nsim))
-            x_sim[:, 0] = x0
-            for k in range(Nsim):
-                u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
-                u_sim[:, k] = u_next
-                x_next = self.furuta_pendulum.step(x_sim[:, k], u_next)
-                x_sim[:, k + 1] = np.array(x_next.full()).flatten()
-                
-            # Simulate closed-loop optimal MPC trajectory for the same initial state
-            print(f"x0: {x0}")
-            x_opt_sim, u_opt_sim, skip = self.furuta_pendulum.close_loop_simulation(
-                x0,
+        if not 0.0 < split_fraction < 1.0:
+            raise ValueError("split_fraction must be between 0 and 1")
+
+        num_theta_only = int(np.floor(N_TEST * split_fraction))
+        num_full_state = N_TEST - num_theta_only
+
+        np.random.seed(seed)
+        theta_1_test_bound = np.pi
+        omega_test_bound = 5.0
+
+        X_theta_only = np.zeros((self.NX, num_theta_only))
+        if num_theta_only > 0:
+            X_theta_only[0, :] = np.random.uniform(
+                -theta_1_test_bound,
+                theta_1_test_bound,
+                size=num_theta_only,
+            )
+
+        full_state_samples = []
+        attempts = 0
+        max_attempts = max(num_full_state * 3, 10)
+        while len(full_state_samples) < num_full_state and attempts < max_attempts:
+            attempts += 1
+            x0_i = np.random.uniform(
+                low=np.array([-theta_1_test_bound, 0.0, 0.0, 0.0]).reshape(-1, 1),
+                high=np.array([theta_1_test_bound, 0.0, 0.0, 0.0]).reshape(-1, 1),
+                size=(self.NX, 1),
+            ).reshape(-1)
+
+            x_opt_sim, _, skip = self.furuta_pendulum.close_loop_simulation(
+                x0_i,
                 Nsim,
                 plot_results=False,
-                warm_start=True
+                warm_start=True,
             )
             if skip:
-                print(f"Skipping trajectory for initial state {x0} due to MPC failure.")
                 continue
-            
-            # Check for NaN values in trajectories
-            if np.isnan(x_sim).any() or np.isnan(u_sim).any():
-                print(f"Test case {i} contains NaN values. Skipping this case.")
-                continue
-            
-            # Store results
-            self.x_opt_batch.append(x_opt_sim.T)
-            self.u_opt_batch.append(u_opt_sim.T)
-            self.x_sim_batch.append(x_sim)
-            self.u_sim_batch.append(u_sim)
-            self.valid_indices.append(i)
-            
-        # Report on valid test cases
-        N_VALID = len(self.valid_indices)
-        N_INVALID = N_TEST - N_VALID
-        if N_INVALID > 0:
-            print(f"\n{N_INVALID} test case(s) were skipped due to NaN values.")
-        print(f"Analyzing {N_VALID} valid test cases...\n")
-            
-        self.plot_closed_loop_trajectories(Nsim)
+
+            idx = np.random.randint(1, Nsim)
+            x_traj_arr = np.array(x_opt_sim)
+            if x_traj_arr.shape[0] == self.NX:
+                x_pick = x_traj_arr[:, idx]
+            else:
+                x_pick = x_traj_arr[idx, :]
+            full_state_samples.append(np.array(x_pick).reshape(-1))
+
+        X_full = np.array(full_state_samples).T if full_state_samples else np.zeros((self.NX, 0))
+
+        self.closed_loop_results = {}
+
+        for label, X_batch in (
+            ("theta_only", X_theta_only),
+            ("full_state", X_full),
+        ):
+            x_opt_batch = []
+            u_opt_batch = []
+            x_sim_batch = []
+            u_sim_batch = []
+            valid_indices = []
+
+            for i in range(X_batch.shape[1]):
+                x0 = X_batch[:, i]
+
+                # Simulate the learned policy in closed loop for the same initial state
+                x_sim = np.zeros((self.NX, Nsim + 1))
+                u_sim = np.zeros((self.NU, Nsim))
+                x_sim[:, 0] = x0
+                for k in range(Nsim):
+                    u_next = self.net_fcn(x_sim[:, k], self.params_init_vec).full().flatten()[0]
+                    u_sim[:, k] = u_next
+                    x_next = self.furuta_pendulum.step(x_sim[:, k], u_next)
+                    x_sim[:, k + 1] = np.array(x_next.full()).flatten()
+
+                # Simulate closed-loop optimal MPC trajectory for the same initial state
+                print(f"x0 ({label}): {x0}")
+                x_opt_sim, u_opt_sim, skip = self.furuta_pendulum.close_loop_simulation(
+                    x0,
+                    Nsim,
+                    plot_results=False,
+                    warm_start=True,
+                )
+                if skip:
+                    print(f"Skipping trajectory for initial state {x0} due to MPC failure.")
+                    continue
+
+                # Check for NaN values in trajectories
+                if np.isnan(x_sim).any() or np.isnan(u_sim).any():
+                    print(f"Test case {i} contains NaN values. Skipping this case.")
+                    continue
+
+                # Store results
+                x_opt_batch.append(x_opt_sim.T)
+                u_opt_batch.append(u_opt_sim.T)
+                x_sim_batch.append(x_sim)
+                u_sim_batch.append(u_sim)
+                valid_indices.append(i)
+
+            self.closed_loop_results[label] = {
+                "x_opt_batch": x_opt_batch,
+                "u_opt_batch": u_opt_batch,
+                "x_sim_batch": x_sim_batch,
+                "u_sim_batch": u_sim_batch,
+                "valid_indices": valid_indices,
+            }
+
+            n_valid = len(valid_indices)
+            n_invalid = X_batch.shape[1] - n_valid
+            if n_invalid > 0:
+                print(f"\n{n_invalid} test case(s) were skipped in {label} due to NaN values.")
+            print(f"Analyzing {n_valid} valid {label} test cases...\n")
+
+            self.plot_closed_loop_trajectories(
+                Nsim,
+                x_opt_batch,
+                x_sim_batch,
+                u_opt_batch,
+                u_sim_batch,
+                title_suffix=label,
+            )
     
     def print_results(self, threshold_rmse=0.01):
         """Print comparison results.
@@ -414,10 +476,12 @@ class FurutaPendulumMPC_RNNComparison:
         print(f"  Max suboptimality: {suboptimality_pct.max():.2f}%")
         print(f"  Min suboptimality: {suboptimality_pct.min():.2f}%")
         
-    def plot_closed_loop_trajectories(self, Nsim):
+    def plot_closed_loop_trajectories(self, Nsim, x_opt_batch, x_sim_batch, u_opt_batch, u_sim_batch, title_suffix=""):
         """Plot closed-loop trajectories for optimal MPC vs learned policy."""
-        N_VALID = len(self.valid_indices)
+        N_VALID = len(x_opt_batch)
         print(f"Plotting closed-loop trajectories for {N_VALID} valid test cases...")
+        if N_VALID == 0:
+            return
         t = self.furuta_pendulum.dt * np.arange(Nsim + 1)
         
         fig, axes = plt.subplots(5, 1, figsize=(11, 12), sharex=True)
@@ -433,8 +497,8 @@ class FurutaPendulumMPC_RNNComparison:
         for s in range(self.NX):
             ax = axes[s]
             for i in range(N_VALID):
-                ax.plot(t, self.x_opt_batch[i][s, :], color='C0', alpha=0.3)
-                ax.plot(t, self.x_sim_batch[i][s, :], color='C1', linestyle='--', alpha=0.3)
+                ax.plot(t, x_opt_batch[i][s, :], color='C0', alpha=0.3)
+                ax.plot(t, x_sim_batch[i][s, :], color='C1', linestyle='--', alpha=0.3)
             ax.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
             ax.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
             ax.axhline(state_refs[s], color='k', linestyle=':', alpha=0.4)
@@ -444,8 +508,8 @@ class FurutaPendulumMPC_RNNComparison:
 
         ax_u = axes[4]
         for i in range(N_VALID):
-            ax_u.plot(t[:-1], self.u_opt_batch[i].flatten(), color='C0', alpha=0.3)
-            ax_u.plot(t[:-1], self.u_sim_batch[i].flatten(), color='C1', linestyle='--', alpha=0.3)
+            ax_u.plot(t[:-1], u_opt_batch[i].flatten(), color='C0', alpha=0.3)
+            ax_u.plot(t[:-1], u_sim_batch[i].flatten(), color='C1', linestyle='--', alpha=0.3)
         ax_u.plot([], [], color='C0', label='Optimal MPC', linewidth=2)
         ax_u.plot([], [], color='C1', linestyle='--', label='Learned Policy', linewidth=2)
         ax_u.axhline(0.0, color='k', linestyle=':', alpha=0.4)
@@ -454,7 +518,8 @@ class FurutaPendulumMPC_RNNComparison:
         ax_u.grid(True, alpha=0.3)
         ax_u.legend(loc='upper right')
 
-        fig.suptitle(f'Furuta Closed-Loop: MPC vs Learned Policy ({N_VALID} Valid Test Cases)')
+        title_suffix_text = f" - {title_suffix}" if title_suffix else ""
+        fig.suptitle(f'Furuta Closed-Loop: MPC vs Learned Policy ({N_VALID} Valid Test Cases){title_suffix_text}')
         plt.tight_layout(rect=[0, 0, 1, 0.98])
     
     def plot_controls(self):
@@ -713,3 +778,13 @@ if __name__ == "__main__":
     # # comparison.plot_costs()
     comparison.run_closed_loop_comparison(Nsim=30)
     comparison.show_plots()
+    
+    # Provide the learned policy to the animation script for visualization
+    # Take the initial state among the test states
+    # idx = np.random.choice(comparison.X_test.shape[1])
+    # x0 = comparison.X_test[:, idx]  # Take a random test state as an example
+    # def policy_fn(x):
+    #     return comparison.net_fcn(x, comparison.params_init_vec).full().flatten()[0]
+    # x_traj, u_traj, anim = comparison.furuta_pendulum.animate(x0, Nsim=50, control_policy=policy_fn, repeat=True)
+
+    print("Testing complete.")

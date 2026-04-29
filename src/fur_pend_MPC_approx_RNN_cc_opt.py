@@ -235,7 +235,7 @@ class FurutaPendulumRNN:
         print("Using Kaiming (He) initialization.")
         return self.parameter_initialization_he()
     
-    def generate_initial_states(self, generate_informative=False):
+    def generate_initial_states(self, generate_informative=False, split_fractions=(1 / 3, 1 / 3, 1 / 3)):
         """Generate initial states for training.
         
         Parameters
@@ -245,40 +245,73 @@ class FurutaPendulumRNN:
             and some random states. 
             If False, only samples uniformly from the training bounds.
             
-        split_train : float
-            Fraction of the batch to use for informative initial states if generate_informative is True.
+        split_fractions : tuple of float
+            Fractions for (1) [theta,0,0,0], (2) open-loop, (3) closed-loop states.
         """
         if generate_informative:
-            # print("Generating informative initial states by solving open-loop MPC...")
-            # Solve open-loop MPC for each initial state to generate initial guess trajectories.
-            self.X_train = np.random.uniform(
-                low=np.array([-self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
-                high=np.array([self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
-                size=(self.NX, self.NB//2)
-            )
-            informative_states = []
-            for i in range(self.NB//2):
-                x0_i = self.X_train[:, i]
-                # print(f"Picking informative states: Solving open-loop MPC for initial state {i + 1}/{self.NB//2}, x0={x0_i}")
-                _, x_traj, u_traj = self.furuta_pend.solve_MPC(x0_i, return_traj=True)
-                # Pick the state at the middle of the trajectory as an informative initial state, 
-                # since the start and end states are often not informative (start is always the same, end is always near the target).
-                idx = np.random.randint(1, self.N - 1)
-                x_mid = np.array(x_traj[:, idx]).reshape(-1)
-                # print(f"Selected informative state from trajectory at time step {idx}: {x_mid}")
-                informative_states.append(x_mid)
-            self.X_train = np.array(informative_states).T
-            # Generate the rest of the initial states randomly
-            num_random = self.NB - self.NB//2
-            # print(f"Generated {len(informative_states)} informative initial states. Generating {num_random} random initial states.")
-            if num_random > 0:
-                X_random = np.random.uniform(
+            if len(split_fractions) != 3:
+                raise ValueError("split_fractions must have 3 elements: (theta, open-loop, closed-loop)")
+
+            split_sum = float(np.sum(split_fractions))
+            if not np.isclose(split_sum, 1.0):
+                raise ValueError("split_fractions must sum to 1.0")
+
+            counts = [int(np.floor(self.NB * frac)) for frac in split_fractions]
+            remainder = self.NB - sum(counts)
+            for i in range(remainder):
+                counts[i % 3] += 1
+            num_theta, num_open_loop, num_closed_loop = counts
+
+            # 1) Initial states of the form [theta, 0, 0, 0]
+            theta_vals = np.random.uniform(-self.theta_1_train_bound, self.theta_1_train_bound, size=num_theta)
+            X_theta = np.zeros((self.NX, num_theta))
+            if num_theta > 0:
+                X_theta[0, :] = theta_vals
+
+            # 2) Optimal states from open-loop simulations
+            open_loop_states = []
+            for _ in range(num_open_loop):
+                x0_i = np.random.uniform(
                     low=np.array([-self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
                     high=np.array([self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
-                    size=(self.NX, num_random)
+                    size=(self.NX, 1)
+                ).reshape(-1)
+                _, x_traj, _ = self.furuta_pend.solve_MPC(x0_i, return_traj=True)
+                idx = np.random.randint(1, self.N - 1)
+                x_traj_arr = np.array(x_traj)
+                if x_traj_arr.shape[0] == self.NX:
+                    x_mid = x_traj_arr[:, idx]
+                else:
+                    x_mid = x_traj_arr[idx, :]
+                open_loop_states.append(np.array(x_mid).reshape(-1))
+            X_open_loop = np.array(open_loop_states).T if open_loop_states else np.zeros((self.NX, 0))
+
+            # 3) Optimal states from closed-loop simulations
+            closed_loop_states = []
+            if num_closed_loop > 0:
+                self.furuta_pend.define_simple_MPC_control(N=self.N)
+            for _ in range(num_closed_loop):
+                x0_i = np.random.uniform(
+                    low=np.array([-self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
+                    high=np.array([self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
+                    size=(self.NX, 1)
+                ).reshape(-1)
+                x_traj, _, _ = self.furuta_pend.close_loop_simulation(
+                    x0_i,
+                    Nsim=self.N*2,
+                    plot_results=False,
+                    warm_start=True,
                 )
-                self.X_train = np.hstack((self.X_train, X_random))
-                
+                idx = np.random.randint(self.N, self.N*2)
+                x_traj_arr = np.array(x_traj)
+                if x_traj_arr.shape[0] == self.NX:
+                    x_mid = x_traj_arr[:, idx]
+                else:
+                    x_mid = x_traj_arr[idx, :]
+                closed_loop_states.append(np.array(x_mid).reshape(-1))
+            X_closed_loop = np.array(closed_loop_states).T if closed_loop_states else np.zeros((self.NX, 0))
+
+            self.X_train = np.hstack((X_theta, X_open_loop, X_closed_loop))
         else:
             self.X_train = np.random.uniform(
                 low=np.array([-self.theta_1_train_bound, 0, 0, 0]).reshape(-1, 1),
@@ -381,7 +414,7 @@ class FurutaPendulumRNN:
         self.initial_controls = np.zeros((self.NU, self.N, self.NB))
         for i in range(self.NB):
             x0_i = self.X_train[:, i]
-            print(f"Solving open-loop MPC for initial state {i + 1}/{self.NB}, x0={x0_i}")
+            # print(f"Solving open-loop MPC for initial state {i + 1}/{self.NB}, x0={x0_i}")
             _, x_traj, u_traj = self.furuta_pend.solve_MPC(x0_i, return_traj=True)
             # Store trajectories
             self.initial_trajectories[:, :, i] = x_traj
@@ -477,7 +510,7 @@ class FurutaPendulumRNN:
         params_init : np.ndarray, optional
             Initial parameters. If None, will use He initialization.
         warm_start : string, optional
-            Method for warm starting the optimization. Options are 'mpc' for using closed loop MPC trajectories, 
+            Method for warm starting the optimization. Options are 'mpc' for using closed-loop MPC trajectories, 
             'col' for using collocation-based state warm start, or None for no warm start.
         """
         print("Setting up optimization for learning problem...")
@@ -607,7 +640,6 @@ class FurutaPendulumRNN:
                 else:
                     w0 += [0.0] * self.NU
 
-                
                 # State at collocation points
                 Xc = []
                 for j in range(self.degree):
@@ -1042,7 +1074,7 @@ def main():
     # Configure the problem
     mpc = FurutaPendulumRNN(
         hidden_sizes=[6, 6],
-        batch_size=100,
+        batch_size=120,
         horizon=12,
         degree=3,
         regularization=1e-4,
@@ -1053,9 +1085,10 @@ def main():
     # Initialize params with warm start
     # warm_params = mpc.network_warm_start_with_sgd(mpc.initialize_parameters(), num_samples=20)
     warm_params = None
-    # if tau_k == tau_init:
-    params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
-    # warm_params = mpc.initialize_parameters(params_file)
+
+    # params_file = mpc.find_latest_params(mpc.model_dir, mpc.model_name, extension="yaml")
+    params_file = "/home/pietro/data-driven/freiburg_stuff/ultro/models_nn/rnn_furuta_pendulum/optimal_params_fp_cc_6x6_2026-04-29_11-06-42.yaml"
+    warm_params = mpc.initialize_parameters(params_file)
 
     # Setup and solve the optimization problem
     mpc.setup_optimization(warm_params, warm_start='mpc')
